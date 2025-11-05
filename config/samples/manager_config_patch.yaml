@@ -1,0 +1,35 @@
+# Example patch to configure the controller manager with environment variables
+# This file can be referenced in your kustomization.yaml to customize the deployment
+#
+# Usage in kustomization.yaml:
+# patches:
+# - path: manager_config_patch.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        env:
+        # Watcher pod image configuration
+        - name: WATCHER_IMAGE
+          value: "ghcr.io/octokode/kyverno-artifact-watcher:latest"
+        # Service account for watcher pods
+        - name: WATCHER_SERVICE_ACCOUNT
+          value: "kyverno-artifact-operator-kyverno-artifact-watcher"
+        # Secret name containing registry credentials
+        - name: WATCHER_SECRET_NAME
+          value: "kyverno-watcher-secret"
+        # GitHub token secret key
+        - name: GITHUB_TOKEN_KEY
+          value: "github-token"
+        # Artifactory credentials secret keys
+        - name: ARTIFACTORY_USERNAME_KEY
+          value: "artifactory-username"
+        - name: ARTIFACTORY_PASSWORD_KEY
+          value: "artifactory-password"

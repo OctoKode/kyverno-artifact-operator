@@ -1,0 +1,207 @@
+name: Build and release operator
+on:
+  push:
+    paths:
+      - Dockerfile
+      - '.dockerignore'
+      - 'cmd/**'
+      - 'api/**'
+      - 'internal/**'
+      - 'config/**'
+      - go.mod
+      - go.sum
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.24']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@00b27aa7cb85167568cb48a3838b75f4265f2bca # master
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go fmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Copy Repo Files
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0  # Ensure all tags are fetched
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          image: tonistiigi/binfmt:qemu-v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Bump the tag
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          latest=$(git tag --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          [[ -z ${latest} ]] && (echo "latest_tag=0.0.1" >> "$GITHUB_OUTPUT") || (echo "latest_tag=$latest" >> "$GITHUB_OUTPUT")
+
+      - name: Calculate new version
+        id: bump
+        run: |
+          tag="${{ steps.get_tag.outputs.latest_tag }}"
+          # Remove "v" if present
+          tag="${tag#v}"
+          IFS='.' read -r major minor patch <<< "$tag"
+          new_tag="$major.$minor.$((patch + 1))"
+          echo "New tag: $new_tag"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          echo "major_tag_version=$major" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          git tag "${{ steps.bump.outputs.new_tag }}"
+          git push origin "${{ steps.bump.outputs.new_tag }}"
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
+        with:
+          go-version: '1.24'
+
+      - name: Install build dependencies
+        run: |
+          make kustomize
+          make controller-gen
+
+      - name: Generate manifests
+        run: make manifests generate
+
+      - name: Build cross-platform binaries
+        run: |
+          VERSION="${{ steps.bump.outputs.new_tag }}"
+          mkdir -p dist
+
+          # Build for multiple platforms
+          for OS in linux darwin windows; do
+            for ARCH in amd64 arm64; do
+              EXT=""
+              if [ "$OS" = "windows" ]; then
+                EXT=".exe"
+              fi
+              echo "Building for $OS/$ARCH..."
+              GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build \
+                -ldflags "-X main.version=${VERSION}" \
+                -o "dist/kyverno-artifact-operator-${OS}-${ARCH}${EXT}" \
+                ./cmd/main.go
+            done
+          done
+
+      - name: Generate installation manifests
+        run: |
+          VERSION="${{ steps.bump.outputs.new_tag }}"
+          IMAGE_NAME_LOWER=$(echo "ghcr.io/${{ github.repository }}:${VERSION}" | tr '[:upper:]' '[:lower:]')
+          make build-installer IMG=${IMAGE_NAME_LOWER}
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum kyverno-artifact-operator-* install.yaml > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          tag_name: ${{ steps.bump.outputs.new_tag }}
+          name: Release ${{ steps.bump.outputs.new_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/kyverno-artifact-operator-*
+            dist/install.yaml
+            dist/checksums.txt
+          body: |
+            ## Installation
+
+            ### Using kubectl
+            ```bash
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ steps.bump.outputs.new_tag }}/install.yaml
+            ```
+
+            ### Using Docker
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.bump.outputs.new_tag }}
+            ```
+
+            ## Binaries
+            Download the appropriate binary for your platform from the assets below.
+
+            ## Checksums
+            See checksums.txt for SHA256 checksums of all artifacts.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retry build and push
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+        with:
+          timeout_minutes: 60
+          max_attempts: 3
+          command: |
+            IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+            docker buildx build \
+              --file Dockerfile \
+              --platform linux/amd64,linux/arm64 \
+              --tag ${IMAGE_NAME_LOWER}:latest \
+              --tag ${IMAGE_NAME_LOWER}:${{ steps.bump.outputs.new_tag }} \
+              --tag ${IMAGE_NAME_LOWER}:${{ steps.bump.outputs.major_tag_version }} \
+              --push \
+              --pull \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              .
+

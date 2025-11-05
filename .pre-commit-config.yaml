@@ -1,0 +1,30 @@
+exclude: '^$'
+fail_fast: false
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    - id: check-added-large-files
+    - id: check-json
+    - id: check-merge-conflict
+    - id: check-symlinks
+    - id: check-yaml
+      args: ['--allow-multiple-documents']
+    - id: detect-aws-credentials
+      args: ['--allow-missing-credential']
+    - id: detect-private-key
+    - id: pretty-format-json
+      args: ['--autofix']
+      exclude: '^\.(reddit|github)/'
+    - id: sort-simple-yaml
+    - id: trailing-whitespace
+-   repo: https://github.com/golangci/golangci-lint
+    rev: v2.5.0
+    hooks:
+    - id: golangci-lint
+      args: ['--fix']
+-   repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+    -   id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
