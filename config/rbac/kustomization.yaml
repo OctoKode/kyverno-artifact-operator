@@ -7,6 +7,8 @@ resources:
 - service_account.yaml
 - role.yaml
 - role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
 # Watcher RBAC for pods created by the operator
 - watcher_service_account.yaml
 - watcher_role.yaml
