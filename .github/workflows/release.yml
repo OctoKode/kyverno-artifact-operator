@@ -176,6 +176,13 @@ jobs:
             docker pull ghcr.io/${{ github.repository }}:${{ steps.bump.outputs.new_tag }}
             ```
 
+            ## Unified Binary
+            This release contains a single binary that can run in two modes:
+            - **Operator mode** (default): Manages KyvernoArtifact custom resources
+            - **Watcher mode** (`-watcher` flag): Monitors OCI registries for policy updates
+
+            The operator automatically deploys watcher pods using the same image.
+
             ## Binaries
             Download the appropriate binary for your platform from the assets below.
 
@@ -196,6 +203,7 @@ jobs:
             docker buildx build \
               --file Dockerfile \
               --platform linux/amd64,linux/arm64 \
+              --build-arg VERSION=${{ steps.bump.outputs.new_tag }} \
               --tag ${IMAGE_NAME_LOWER}:latest \
               --tag ${IMAGE_NAME_LOWER}:${{ steps.bump.outputs.new_tag }} \
               --tag ${IMAGE_NAME_LOWER}:${{ steps.bump.outputs.major_tag_version }} \

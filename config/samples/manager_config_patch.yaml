@@ -18,10 +18,10 @@ spec:
         env:
         # Watcher pod image configuration
         - name: WATCHER_IMAGE
-          value: "ghcr.io/octokode/kyverno-artifact-watcher:latest"
+          value: "ghcr.io/octokode/kyverno-artifact-operator:latest"
         # Service account for watcher pods
         - name: WATCHER_SERVICE_ACCOUNT
-          value: "kyverno-artifact-operator-kyverno-artifact-watcher"
+          value: "kyverno-artifact-operator-watcher"
         # Secret name containing registry credentials
         - name: WATCHER_SECRET_NAME
           value: "kyverno-watcher-secret"

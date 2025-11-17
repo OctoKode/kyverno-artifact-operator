@@ -10,8 +10,8 @@ The following environment variables can be set on the controller deployment to o
 
 | Environment Variable | Description | Default Value |
 |---------------------|-------------|---------------|
-| `WATCHER_IMAGE` | Container image for the watcher pods | `ghcr.io/octokode/kyverno-artifact-watcher:latest` |
-| `WATCHER_SERVICE_ACCOUNT` | Service account name for watcher pods | `kyverno-artifact-operator-kyverno-artifact-watcher` |
+| `WATCHER_IMAGE` | Container image for the watcher pods | `ghcr.io/octokode/kyverno-artifact-operator:latest` |
+| `WATCHER_SERVICE_ACCOUNT` | Service account name for watcher pods | `kyverno-artifact-operator-watcher` |
 
 ### Secret Configuration
 
@@ -63,7 +63,7 @@ spec:
       - name: manager
         env:
         - name: WATCHER_IMAGE
-          value: "ghcr.io/octokode/kyverno-artifact-watcher:v1.2.3"
+          value: "ghcr.io/octokode/kyverno-artifact-operator:v1.2.3"
         - name: WATCHER_SECRET_NAME
           value: "my-registry-secret"
 ```
@@ -87,7 +87,7 @@ patches:
 ```bash
 kubectl set env deployment/kyverno-artifact-operator-controller-manager \
   -n kyverno-artifact-operator-system \
-  WATCHER_IMAGE=ghcr.io/octokode/kyverno-artifact-watcher:v1.2.3 \
+  WATCHER_IMAGE=ghcr.io/octokode/kyverno-artifact-operator:v1.2.3 \
   WATCHER_SECRET_NAME=my-registry-secret
 ```
 

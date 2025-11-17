@@ -1,12 +1,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kyverno-artifact-watcher-rolebinding
+  name: kyverno-artifact-operator-watcher-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kyverno-artifact-watcher-role
+  name: kyverno-artifact-operator-watcher-role
 subjects:
 - kind: ServiceAccount
-  name: kyverno-artifact-watcher
+  name: kyverno-artifact-operator-watcher
   namespace: default

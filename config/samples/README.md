@@ -18,8 +18,8 @@ The following environment variables can be set on the controller deployment:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WATCHER_IMAGE` | `ghcr.io/octokode/kyverno-artifact-watcher:latest` | Watcher container image |
-| `WATCHER_SERVICE_ACCOUNT` | `kyverno-artifact-operator-kyverno-artifact-watcher` | Service account for watcher pods |
+| `WATCHER_IMAGE` | `ghcr.io/octokode/kyverno-artifact-operator:latest` | Watcher container image (same as operator) |
+| `WATCHER_SERVICE_ACCOUNT` | `kyverno-artifact-operator-watcher` | Service account for watcher pods |
 | `WATCHER_SECRET_NAME` | `kyverno-watcher-secret` | Secret containing credentials |
 | `GITHUB_TOKEN_KEY` | `github-token` | Secret key for GitHub token |
 | `ARTIFACTORY_USERNAME_KEY` | `artifactory-username` | Secret key for Artifactory username |

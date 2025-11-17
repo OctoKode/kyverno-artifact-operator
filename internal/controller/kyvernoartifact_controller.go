@@ -50,8 +50,8 @@ type Config struct {
 // DefaultConfig returns the default configuration
 func DefaultConfig() Config {
 	return Config{
-		WatcherImage:           getEnvOrDefault("WATCHER_IMAGE", "ghcr.io/octokode/kyverno-artifact-watcher:latest"),
-		WatcherServiceAccount:  getEnvOrDefault("WATCHER_SERVICE_ACCOUNT", "kyverno-artifact-operator-kyverno-artifact-watcher"),
+		WatcherImage:           getEnvOrDefault("WATCHER_IMAGE", "ghcr.io/octokode/kyverno-artifact-operator:latest"),
+		WatcherServiceAccount:  getEnvOrDefault("WATCHER_SERVICE_ACCOUNT", "kyverno-artifact-operator-watcher"),
 		SecretName:             getEnvOrDefault("WATCHER_SECRET_NAME", "kyverno-watcher-secret"),
 		GitHubTokenKey:         getEnvOrDefault("GITHUB_TOKEN_KEY", "github-token"),
 		ArtifactoryUsernameKey: getEnvOrDefault("ARTIFACTORY_USERNAME_KEY", "artifactory-username"),
@@ -80,10 +80,6 @@ type KyvernoArtifactReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the KyvernoArtifact object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/reconcile
@@ -200,6 +196,7 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						Name:            "watcher",
 						Image:           r.Config.WatcherImage,
 						ImagePullPolicy: corev1.PullAlways,
+						Args:            []string{"-watcher"},
 						Env:             envVars,
 						VolumeMounts: []corev1.VolumeMount{
 							{
