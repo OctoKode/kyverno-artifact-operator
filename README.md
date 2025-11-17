@@ -6,12 +6,16 @@ Kubernetes operator that automatically syncs Kyverno policies from OCI artifacts
 
 The Kyverno Artifact Operator watches OCI artifacts for changes and automatically applies Kyverno policies to your Kubernetes cluster. When you push a new version of your policy artifact, the operator detects the change, pulls the new policies, and applies them to your cluster.
 
+This repository combines both the operator and watcher functionality into a single binary that can operate in two modes:
+- **Operator mode** (default): Manages KyvernoArtifact custom resources and deploys watcher pods
+- **Watcher mode** (`-watcher` flag): Continuously monitors OCI registries for policy updates
+
 **Features:**
-- 🔄 Automatic policy synchronization from OCI registries
-- 📦 Support for GitHub Container Registry (GHCR) and Artifactory
-- ⏱️ Configurable polling intervals
-- 🔒 Secure token management via Kubernetes secrets
-- 📊 Prometheus metrics for monitoring
+- Automatic policy synchronization from OCI registries
+- Support for GitHub Container Registry (GHCR) and Artifactory
+- Configurable polling intervals
+- Secure token management via Kubernetes secrets
+- Prometheus metrics for monitoring
 
 ## Quick Start
 
@@ -76,6 +80,22 @@ spec:
 kubectl apply -f my-artifact.yaml
 ```
 
+## Troubleshooting
+
+### "no matches for kyverno.octokode.io/v1alpha1" Error
+
+If you see this error when running the operator:
+```
+unable to retrieve the complete list of server APIs: kyverno.octokode.io/v1alpha1: no matches for kyverno.octokode.io/v1alpha1
+```
+
+**Solution:** Install the CRDs first:
+```bash
+make install
+```
+
+Or use `make run` which automatically installs CRDs before starting the operator.
+
 ### 4. Verify
 
 ```bash
@@ -111,17 +131,58 @@ kubectl set env deployment/kyverno-artifact-operator-controller-manager \
 
 ## Getting Started
 
+### Binary Modes
+
+The `manager` binary can run in two modes:
+
+```bash
+# Operator mode (default) - manages KyvernoArtifact CRDs
+./bin/manager
+
+# Watcher mode - directly monitors OCI registry for changes
+./bin/manager -watcher
+```
+
+When running in watcher mode, the binary requires these environment variables:
+- `IMAGE_BASE`: OCI image reference (e.g., `ghcr.io/owner/package`)
+- `PROVIDER`: Registry provider (`github` or `artifactory`)
+- `GITHUB_TOKEN`: GitHub token (for GitHub provider)
+- `ARTIFACTORY_USERNAME` and `ARTIFACTORY_PASSWORD`: Credentials (for Artifactory provider)
+- `POLL_INTERVAL`: Poll interval in seconds (default: 30)
+
 ### Prerequisites
 - go version v1.24.0+
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
 
+### Running Locally
+
+**Run the operator (automatically installs CRDs):**
+
+```sh
+make run
+```
+
+This will:
+1. Generate manifests
+2. Install CRDs into your cluster
+3. Start the operator locally
+
+**Note:** The operator requires a Kubernetes cluster. Make sure your `kubectl` is configured to point to a cluster.
+
 ### To Deploy on the cluster
+
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
 make docker-build docker-push IMG=<some-registry>/kyverno-artifact-operator:tag
+```
+
+The build automatically embeds the git version into the binary. You can also set a custom version:
+
+```sh
+VERSION=v1.0.0 make docker-build IMG=<some-registry>/kyverno-artifact-operator:v1.0.0
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -214,27 +275,3 @@ if you create webhooks, you need to use the above command with
 the '--force' flag and manually ensure that any custom configuration
 previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
 is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-

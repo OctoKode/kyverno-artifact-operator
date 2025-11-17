@@ -16,11 +16,11 @@ controller:
   env:
     # Watcher pod image configuration
     - name: WATCHER_IMAGE
-      value: "ghcr.io/octokode/kyverno-artifact-watcher:latest"
+      value: "ghcr.io/octokode/kyverno-artifact-operator:latest"
 
     # Service account for watcher pods
     - name: WATCHER_SERVICE_ACCOUNT
-      value: "kyverno-artifact-operator-kyverno-artifact-watcher"
+      value: "kyverno-artifact-operator-watcher"
 
     # Secret name containing registry credentials
     - name: WATCHER_SECRET_NAME
@@ -43,7 +43,7 @@ controller:
 # controller:
 #   env:
 #     - name: WATCHER_IMAGE
-#       value: "myregistry.io/kyverno-watcher:v1.0.0"
+#       value: "myregistry.io/kyverno-operator:v1.0.0"
 #     - name: WATCHER_SECRET_NAME
 #       value: "my-registry-credentials"
 #     - name: GITHUB_TOKEN_KEY
@@ -54,7 +54,7 @@ controller:
 # controller:
 #   env:
 #     - name: WATCHER_IMAGE
-#       value: "ghcr.io/octokode/kyverno-artifact-watcher:dev"
+#       value: "ghcr.io/octokode/kyverno-artifact-operator:dev"
 #     - name: WATCHER_SECRET_NAME
 #       value: "dev-registry-secret"
 
@@ -62,6 +62,6 @@ controller:
 # controller:
 #   env:
 #     - name: WATCHER_IMAGE
-#       value: "ghcr.io/octokode/kyverno-artifact-watcher:v1.2.3"
+#       value: "ghcr.io/octokode/kyverno-artifact-operator:v1.2.3"
 #     - name: WATCHER_SECRET_NAME
 #       value: "prod-registry-secret"

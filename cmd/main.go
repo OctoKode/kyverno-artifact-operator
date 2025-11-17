@@ -37,7 +37,13 @@ import (
 
 	kyvernov1alpha1 "github.com/OctoKode/kyverno-artifact-operator/api/v1alpha1"
 	"github.com/OctoKode/kyverno-artifact-operator/internal/controller"
+	"github.com/OctoKode/kyverno-artifact-operator/internal/watcher"
 	// +kubebuilder:scaffold:imports
+)
+
+var (
+	// Version is set via ldflags during build
+	Version = "dev"
 )
 
 var (
@@ -54,6 +60,21 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// Check for watcher mode first
+	watcherMode := false
+	for _, arg := range os.Args[1:] {
+		if arg == "-watcher" || arg == "--watcher" {
+			watcherMode = true
+			break
+		}
+	}
+
+	if watcherMode {
+		watcher.Run(Version)
+		return
+	}
+
+	// Continue with operator mode
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -141,7 +162,7 @@ func main() {
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
 	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
+	// If you enable certManager, uncomment the following lines:
 	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
 	// managed by cert-manager for the metrics server.
 	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
