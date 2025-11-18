@@ -22,9 +22,14 @@ COPY . .
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "-X main.Version=${VERSION}" -o manager ./cmd/main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# Use Alpine as base image to support kubectl for watcher mode
+FROM alpine:3.22
+
+# Install ca-certificates and kubectl (needed for watcher mode)
+RUN apk add --no-cache ca-certificates curl && \
+    curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/kubectl" -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
