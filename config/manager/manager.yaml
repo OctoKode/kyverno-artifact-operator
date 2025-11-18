@@ -29,7 +29,6 @@ spec:
       - command:
         - /manager
         args:
-          - --leader-elect
           - --health-probe-bind-address=:8081
         image: ghcr.io/octokode/kyverno-artifact-operator:latest
         name: manager
