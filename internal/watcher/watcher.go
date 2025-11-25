@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
@@ -730,19 +731,45 @@ func applyManifestsReal(config *Config, dir string) error {
 	return nil
 }
 
-// applyManifestFile reads a YAML file and applies it to the cluster
+// applyManifestFile reads a YAML file and applies it to the cluster.
+// It supports multi-document YAML files (documents separated by ---).
 func applyManifestFile(filePath string, dynamicClient dynamic.Interface) error {
-	data, err := os.ReadFile(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	decoder := k8syaml.NewYAMLOrJSONDecoder(f, 4096)
+	docIndex := 0
+
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to decode YAML document %d: %w", docIndex, err)
+		}
+
+		// Skip empty documents (e.g., documents with only comments or whitespace)
+		if len(obj.Object) == 0 {
+			docIndex++
+			continue
+		}
+
+		if err := applyResource(obj, dynamicClient); err != nil {
+			return fmt.Errorf("failed to apply document %d: %w", docIndex, err)
+		}
+
+		docIndex++
 	}
 
-	// Parse YAML to unstructured
-	obj := &unstructured.Unstructured{}
-	if err := yaml.Unmarshal(data, obj); err != nil {
-		return fmt.Errorf("failed to parse YAML: %w", err)
-	}
+	return nil
+}
 
+// applyResource applies a single unstructured resource to the cluster
+func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interface) error {
 	// Get GVR from the object
 	gvk := obj.GroupVersionKind()
 	gvr := schema.GroupVersionResource{
