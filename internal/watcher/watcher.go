@@ -820,8 +820,20 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 	ctx := context.Background()
 	namespace := obj.GetNamespace()
 
+	// Determine if resource is cluster-scoped or namespaced based on the REST mapping
+	// Some resources like ClusterPolicy have namespace in their YAML but are actually cluster-scoped
+	isNamespaced := mapping.Scope.Name() == meta.RESTScopeNameNamespace
+
+	// If resource is cluster-scoped, remove namespace field if present
+	if !isNamespaced && namespace != "" {
+		log.Printf("Warning: %s/%s is cluster-scoped but has namespace '%s' - removing namespace field\n",
+			gvk.Kind, obj.GetName(), namespace)
+		obj.SetNamespace("")
+		namespace = ""
+	}
+
 	// Try to create or update the resource
-	if namespace != "" {
+	if isNamespaced && namespace != "" {
 		// Namespaced resource
 		existing, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
 		if err != nil {

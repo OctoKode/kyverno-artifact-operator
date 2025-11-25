@@ -21,6 +21,8 @@ var (
 	Version = "dev"
 	// getKubeClientFunc can be overridden in tests
 	getKubeClientFunc = k8s.GetClient
+	// orphanedPolicies tracks when policies were first detected as orphaned
+	orphanedPolicies = make(map[string]time.Time)
 )
 
 // PolicyInfo holds basic policy information
@@ -61,9 +63,32 @@ func collectGarbage() {
 
 	orphanedCount := 0
 	for _, policy := range policies {
+		policyKey := getPolicyKey(policy)
+
 		if isOrphaned(policy, clientset, dynamicClient) {
-			log.Printf("Found orphaned policy: %s (namespace: %s, kind: %s)\n",
-				policy.Name, policy.Namespace, policy.Kind)
+			firstSeen, exists := orphanedPolicies[policyKey]
+			if !exists {
+				// First time seeing this policy as orphaned - record the time
+				orphanedPolicies[policyKey] = time.Now()
+				log.Printf("Found orphaned policy: %s (namespace: %s, kind: %s) - will wait one cycle before deletion\n",
+					policy.Name, policy.Namespace, policy.Kind)
+				continue
+			}
+
+			// Check if we've waited long enough (at least one polling interval)
+			waitDuration := time.Since(firstSeen)
+			log.Printf("Policy %s has been orphaned for %v - checking again before deletion\n",
+				policy.Name, waitDuration)
+
+			// Re-check if still orphaned after the grace period
+			if !isOrphaned(policy, clientset, dynamicClient) {
+				log.Printf("Policy %s is no longer orphaned - removing from orphan tracking\n", policy.Name)
+				delete(orphanedPolicies, policyKey)
+				continue
+			}
+
+			// Still orphaned after grace period and recheck - safe to delete
+			log.Printf("Policy %s still orphaned after grace period - proceeding with deletion\n", policy.Name)
 
 			if err := deletePolicy(policy, dynamicClient); err != nil {
 				log.Printf("Error deleting orphaned policy %s: %v\n", policy.Name, err)
@@ -71,7 +96,14 @@ func collectGarbage() {
 			}
 
 			log.Printf("Successfully deleted orphaned policy: %s\n", policy.Name)
+			delete(orphanedPolicies, policyKey)
 			orphanedCount++
+		} else {
+			// Policy is not orphaned - remove from tracking if it was there
+			if _, exists := orphanedPolicies[policyKey]; exists {
+				log.Printf("Policy %s is no longer orphaned - removing from orphan tracking\n", policy.Name)
+				delete(orphanedPolicies, policyKey)
+			}
 		}
 	}
 
@@ -80,6 +112,14 @@ func collectGarbage() {
 	} else {
 		log.Println("Garbage collection complete: no orphaned policies found")
 	}
+}
+
+// getPolicyKey generates a unique key for a policy
+func getPolicyKey(policy PolicyInfo) string {
+	if policy.Namespace != "" {
+		return fmt.Sprintf("%s/%s/%s", policy.Kind, policy.Namespace, policy.Name)
+	}
+	return fmt.Sprintf("%s/%s", policy.Kind, policy.Name)
 }
 
 // getManagedPolicies returns all Policy and ClusterPolicy resources with managed-by=kyverno-watcher label
