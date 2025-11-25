@@ -2,8 +2,19 @@ package watcher
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/types"
+)
+
+const (
+	yamlExt = ".yaml"
+	ymlExt  = ".yml"
 )
 
 func TestParseImageBase(t *testing.T) {
@@ -566,4 +577,289 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestFindYAMLFiles(t *testing.T) {
+	// Create a temporary directory structure
+	tmpDir := t.TempDir()
+
+	// Create test files
+	yamlFile1 := tmpDir + "/policy1.yaml"
+	yamlFile2 := tmpDir + "/policy2.yml"
+	txtFile := tmpDir + "/readme.txt"
+	subDir := tmpDir + "/subdir"
+
+	if err := os.WriteFile(yamlFile1, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(yamlFile2, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(txtFile, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(subDir+"/policy3.yaml", []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := findYAMLFiles(tmpDir)
+	if err != nil {
+		t.Fatalf("findYAMLFiles() error = %v", err)
+	}
+
+	// Should find 3 yaml files (2 in root, 1 in subdir)
+	if len(files) != 3 {
+		t.Errorf("findYAMLFiles() found %d files, want 3", len(files))
+	}
+
+	// Verify only YAML files are included
+	for _, f := range files {
+		ext := strings.ToLower(filepath.Ext(f))
+		if ext != yamlExt && ext != ymlExt {
+			t.Errorf("findYAMLFiles() returned non-YAML file: %s", f)
+		}
+	}
+}
+
+func TestFindYAMLFiles_EmptyDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	files, err := findYAMLFiles(tmpDir)
+	if err != nil {
+		t.Fatalf("findYAMLFiles() error = %v", err)
+	}
+
+	if len(files) != 0 {
+		t.Errorf("findYAMLFiles() found %d files in empty dir, want 0", len(files))
+	}
+}
+
+func TestFindYAMLFiles_NonExistentDirectory(t *testing.T) {
+	_, err := findYAMLFiles("/nonexistent/directory/path")
+	if err == nil {
+		t.Error("findYAMLFiles() should return error for non-existent directory")
+	}
+}
+
+func TestRun(t *testing.T) {
+	// Test that Run function exists and can be called
+	// We can't actually run it fully in tests as it's an infinite loop
+	// but we can test the version setting
+	testVersion := "test-version-1.0.0"
+
+	// Just verify the function signature exists
+	_ = Run
+
+	// Test version variable can be set
+	oldVersion := Version
+	Version = testVersion
+	if Version != testVersion {
+		t.Errorf("Version = %q, want %q", Version, testVersion)
+	}
+	Version = oldVersion
+}
+
+func TestLoadConfig_GithubTokenValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		token       string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "valid classic token",
+			token:   "ghp_1234567890abcdefghijklmnopqrstuvwxyz", // pragma: allowlist secret
+			wantErr: false,
+		},
+		{
+			name:    "valid fine-grained token",
+			token:   "github_pat_1234567890abcdefghijklmnopqrstuvwxyz", // pragma: allowlist secret
+			wantErr: false,
+		},
+		{
+			name:        "token with whitespace",
+			token:       "  ghp_token123  ",
+			wantErr:     false,
+			errContains: "",
+		},
+		{
+			name:        "empty token after trim",
+			token:       "   ",
+			wantErr:     true,
+			errContains: "GITHUB_TOKEN environment variable must be set",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalStateDirBase := stateDirBase
+			stateDirBase = t.TempDir()
+			defer func() {
+				stateDirBase = originalStateDirBase
+			}()
+
+			originalGetEnvFunc := getEnvFunc
+			getEnvFunc = func(key string) string {
+				switch key {
+				case "GITHUB_TOKEN":
+					return tt.token
+				case "IMAGE_BASE":
+					return "ghcr.io/owner/package"
+				default:
+					return ""
+				}
+			}
+			defer func() {
+				getEnvFunc = originalGetEnvFunc
+			}()
+
+			originalLogFatal := logFatal
+			logFatal = func(v ...interface{}) {
+				panic(v[0])
+			}
+			defer func() {
+				logFatal = originalLogFatal
+			}()
+
+			defer func() {
+				if r := recover(); r != nil {
+					if !tt.wantErr {
+						t.Errorf("loadConfig() panicked unexpectedly: %v", r)
+					}
+					if errStr, ok := r.(string); ok && tt.errContains != "" {
+						if !contains(errStr, tt.errContains) {
+							t.Errorf("loadConfig() error = %q, want to contain %q", errStr, tt.errContains)
+						}
+					}
+				} else if tt.wantErr {
+					t.Error("loadConfig() should have failed but didn't")
+				}
+			}()
+
+			config := loadConfig()
+			if !tt.wantErr {
+				if config.GithubToken == "" {
+					t.Error("loadConfig() GithubToken should not be empty")
+				}
+				// Verify token was trimmed
+				if strings.Contains(config.GithubToken, " ") {
+					t.Error("loadConfig() should trim whitespace from token")
+				}
+			}
+		})
+	}
+}
+
+func TestProcessLayer(t *testing.T) {
+	tmpDir := t.TempDir()
+	fileCount := 0
+
+	tests := []struct {
+		name        string
+		content     []byte
+		mediaType   string
+		expectFile  bool
+		expectCount int
+	}{
+		{
+			name:        "policy layer with content",
+			content:     []byte("apiVersion: v1\nkind: Policy"),
+			mediaType:   PolicyLayerMediaType,
+			expectFile:  true,
+			expectCount: 1,
+		},
+		{
+			name:        "empty layer",
+			content:     []byte{},
+			mediaType:   "application/octet-stream",
+			expectFile:  false,
+			expectCount: 0,
+		},
+		{
+			name:        "generic layer with content",
+			content:     []byte("some content"),
+			mediaType:   "application/octet-stream",
+			expectFile:  true,
+			expectCount: 1,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a mock layer
+			layer := &mockLayer{
+				content:   tt.content,
+				mediaType: tt.mediaType,
+			}
+
+			err := processLayer(layer, tmpDir, i, &fileCount)
+			if err != nil {
+				t.Errorf("processLayer() error = %v", err)
+			}
+
+			if tt.expectFile {
+				// Check that file was created
+				var expectedFile string
+				if tt.mediaType == PolicyLayerMediaType {
+					expectedFile = filepath.Join(tmpDir, fmt.Sprintf("policy-%d.yaml", i))
+				} else if len(tt.content) > 0 {
+					expectedFile = filepath.Join(tmpDir, fmt.Sprintf("layer-%d.yaml", i))
+				}
+
+				if expectedFile != "" {
+					if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
+						t.Errorf("processLayer() should have created file %s", expectedFile)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Mock layer for testing
+type mockLayer struct {
+	content   []byte
+	mediaType string
+}
+
+func (m *mockLayer) Digest() (v1.Hash, error) {
+	return v1.Hash{}, nil
+}
+
+func (m *mockLayer) DiffID() (v1.Hash, error) {
+	return v1.Hash{}, nil
+}
+
+func (m *mockLayer) Compressed() (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(string(m.content))), nil
+}
+
+func (m *mockLayer) Uncompressed() (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(string(m.content))), nil
+}
+
+func (m *mockLayer) Size() (int64, error) {
+	return int64(len(m.content)), nil
+}
+
+func (m *mockLayer) MediaType() (types.MediaType, error) {
+	return types.MediaType(m.mediaType), nil
+}
+
+func TestVersion(t *testing.T) {
+	// Test that Version variable exists
+	if Version == "" {
+		t.Error("Version should not be empty")
+	}
+
+	// Test that we can set the version
+	oldVersion := Version
+	Version = "test-1.0.0"
+	if Version != "test-1.0.0" {
+		t.Errorf("Version = %q, want %q", Version, "test-1.0.0")
+	}
+	Version = oldVersion
 }

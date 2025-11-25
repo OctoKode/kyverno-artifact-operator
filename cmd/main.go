@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -37,6 +38,7 @@ import (
 
 	kyvernov1alpha1 "github.com/OctoKode/kyverno-artifact-operator/api/v1alpha1"
 	"github.com/OctoKode/kyverno-artifact-operator/internal/controller"
+	"github.com/OctoKode/kyverno-artifact-operator/internal/gc"
 	"github.com/OctoKode/kyverno-artifact-operator/internal/watcher"
 	// +kubebuilder:scaffold:imports
 )
@@ -62,15 +64,31 @@ func init() {
 func main() {
 	// Check for watcher mode first
 	watcherMode := false
+	gcMode := false
 	for _, arg := range os.Args[1:] {
 		if arg == "-watcher" || arg == "--watcher" {
 			watcherMode = true
+			break
+		}
+		if arg == "gc" || arg == "--garbage-collect" {
+			gcMode = true
 			break
 		}
 	}
 
 	if watcherMode {
 		watcher.Run(Version)
+		return
+	}
+
+	if gcMode {
+		pollInterval := 30
+		if val := os.Getenv("POLL_INTERVAL"); val != "" {
+			if parsed, err := strconv.Atoi(val); err == nil {
+				pollInterval = parsed
+			}
+		}
+		gc.Run(Version, pollInterval)
 		return
 	}
 
