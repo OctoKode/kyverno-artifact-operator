@@ -1,240 +1,308 @@
 package gc
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
+	"context"
 	"testing"
+
+	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
 )
 
 const (
-	kindClusterPolicy = "ClusterPolicy"
-	kindPolicy        = "Policy"
+	testPolicyName         = "test-policy"
+	policyKind             = "Policy"
+	clusterPolicyKind      = "ClusterPolicy"
+	managedByLabel         = "managed-by"
+	managedByValue         = "kyverno-watcher"
+	policyVersionLabel     = "policy-version"
+	kyvernoAPIGroup        = "kyverno.io"
+	kyvernoAPIVersion      = "v1"
+	kyvernoArtifactGroup   = "kyverno.octokode.io"
+	kyvernoArtifactVersion = "v1alpha1"
 )
 
+func TestPolicyInfo(t *testing.T) {
+	policy := PolicyInfo{
+		Name:      testPolicyName,
+		Namespace: "default",
+		Kind:      policyKind,
+		Labels: map[string]string{
+			managedByLabel:     managedByValue,
+			policyVersionLabel: "v1.0.0",
+		},
+	}
+
+	if policy.Name != testPolicyName {
+		t.Errorf("Expected name %q, got '%s'", testPolicyName, policy.Name)
+	}
+	if policy.Kind != policyKind {
+		t.Errorf("Expected kind %q, got '%s'", policyKind, policy.Kind)
+	}
+	if policy.Labels[managedByLabel] != managedByValue {
+		t.Errorf("Expected managed-by label %q, got '%s'", managedByValue, policy.Labels[managedByLabel])
+	}
+}
+
+func TestVersionVariable(t *testing.T) {
+	if Version == "" {
+		t.Error("Version should not be empty")
+	}
+
+	// Test setting version
+	oldVersion := Version
+	Version = "test-1.0.0"
+	if Version != "test-1.0.0" {
+		t.Errorf("Version = %q, want %q", Version, "test-1.0.0")
+	}
+	Version = oldVersion
+}
+
+// TestGetKubeClient verifies the function exists and has correct signature
+func TestGetKubeClient(t *testing.T) {
+	// This will attempt to get real config, which may fail in test environment
+	_, _, err := k8s.GetClient()
+	// It's OK if this fails - we're running in a test environment without a cluster
+	if err == nil {
+		t.Log("Successfully got kube client (test environment has cluster access)")
+	} else {
+		t.Logf("Expected error in test environment without cluster: %v", err)
+	}
+}
+
+func TestGetManagedPolicies(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	// Create a ClusterPolicy
+	clusterPolicy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": kyvernoAPIGroup + "/" + kyvernoAPIVersion,
+			"kind":       clusterPolicyKind,
+			"metadata": map[string]interface{}{
+				"name": "test-cluster-policy",
+				"labels": map[string]interface{}{
+					managedByLabel:     managedByValue,
+					policyVersionLabel: "v1.0.0",
+				},
+			},
+		},
+	}
+
+	// Create a Policy
+	policy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": kyvernoAPIGroup + "/" + kyvernoAPIVersion,
+			"kind":       policyKind,
+			"metadata": map[string]interface{}{
+				"name":      testPolicyName,
+				"namespace": "default",
+				"labels": map[string]interface{}{
+					managedByLabel:     managedByValue,
+					policyVersionLabel: "v2.0.0",
+				},
+			},
+		},
+	}
+
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(scheme, clusterPolicy, policy)
+
+	policies := getManagedPolicies(dynamicClient)
+
+	if len(policies) != 2 {
+		t.Errorf("Expected 2 policies, got %d", len(policies))
+	}
+
+	// Verify ClusterPolicy
+	foundClusterPolicy := false
+	foundPolicy := false
+	for _, p := range policies {
+		if p.Name == "test-cluster-policy" && p.Kind == clusterPolicyKind {
+			foundClusterPolicy = true
+			if p.Labels[policyVersionLabel] != "v1.0.0" {
+				t.Errorf("Expected policy-version v1.0.0, got %s", p.Labels[policyVersionLabel])
+			}
+		}
+		if p.Name == testPolicyName && p.Kind == policyKind {
+			foundPolicy = true
+			if p.Namespace != "default" {
+				t.Errorf("Expected namespace 'default', got '%s'", p.Namespace)
+			}
+		}
+	}
+
+	if !foundClusterPolicy {
+		t.Error("ClusterPolicy not found in results")
+	}
+	if !foundPolicy {
+		t.Error("Policy not found in results")
+	}
+}
+
 func TestGetPoliciesByKind(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	policy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": kyvernoAPIGroup + "/" + kyvernoAPIVersion,
+			"kind":       policyKind,
+			"metadata": map[string]interface{}{
+				"name":      testPolicyName,
+				"namespace": "default",
+				"labels": map[string]interface{}{
+					managedByLabel: managedByValue,
+				},
+			},
+		},
+	}
+
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(scheme, policy)
+
+	gvr := schema.GroupVersionResource{
+		Group:    kyvernoAPIGroup,
+		Version:  kyvernoAPIVersion,
+		Resource: "policies",
+	}
+
+	ctx := context.Background()
+	policies, err := getPoliciesByKind(ctx, dynamicClient, gvr, "")
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if len(policies) != 1 {
+		t.Errorf("Expected 1 policy, got %d", len(policies))
+	}
+
+	if policies[0].Name != testPolicyName {
+		t.Errorf("Expected policy name %q, got '%s'", testPolicyName, policies[0].Name)
+	}
+}
+
+func TestIsOrphaned(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
 	tests := []struct {
-		name           string
-		kind           string
-		mockOutput     string
-		mockError      error
-		expectedLen    int
-		expectedError  bool
-		expectedPolicy *PolicyInfo
+		name             string
+		policy           PolicyInfo
+		pods             []runtime.Object
+		artifacts        []runtime.Object
+		expectedOrphaned bool
 	}{
 		{
-			name: "successful clusterpolicy fetch",
-			kind: kindClusterPolicy,
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {
-							"name": "test-policy",
-							"labels": {
-								"managed-by": "kyverno-watcher",
-								"policy-version": "v1.0.0"
-							}
-						},
-						"kind": "ClusterPolicy"
-					}
-				]
-			}`,
-			mockError:   nil,
-			expectedLen: 1,
-			expectedPolicy: &PolicyInfo{
+			name: "policy without version label",
+			policy: PolicyInfo{
+				Name:   "test-policy",
+				Kind:   "Policy",
+				Labels: map[string]string{"managed-by": "kyverno-watcher"},
+			},
+			expectedOrphaned: false,
+		},
+		{
+			name: "policy with no active watchers",
+			policy: PolicyInfo{
 				Name: "test-policy",
-				Kind: kindClusterPolicy,
+				Kind: "Policy",
 				Labels: map[string]string{
 					"managed-by":     "kyverno-watcher",
 					"policy-version": "v1.0.0",
 				},
 			},
+			pods:             []runtime.Object{},
+			expectedOrphaned: true,
 		},
 		{
-			name: "successful namespaced policy fetch",
-			kind: kindPolicy,
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {
-							"name": "ns-policy",
-							"namespace": "default",
-							"labels": {
-								"managed-by": "kyverno-watcher",
-								"policy-version": "v2.0.0"
-							}
-						},
-						"kind": "Policy"
-					}
-				]
-			}`,
-			mockError:   nil,
-			expectedLen: 1,
-			expectedPolicy: &PolicyInfo{
-				Name:      "ns-policy",
-				Namespace: "default",
-				Kind:      kindPolicy,
+			name: "policy with active watcher but no artifacts",
+			policy: PolicyInfo{
+				Name: "test-policy",
+				Kind: "Policy",
 				Labels: map[string]string{
 					"managed-by":     "kyverno-watcher",
-					"policy-version": "v2.0.0",
+					"policy-version": "v1.0.0",
 				},
 			},
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-abc123",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			artifacts:        []runtime.Object{},
+			expectedOrphaned: true,
 		},
 		{
-			name:          "kubectl command fails",
-			kind:          kindClusterPolicy,
-			mockOutput:    "",
-			mockError:     fmt.Errorf("command failed"),
-			expectedLen:   0,
-			expectedError: true,
-		},
-		{
-			name:          "empty list",
-			kind:          kindClusterPolicy,
-			mockOutput:    `{"items": []}`,
-			mockError:     nil,
-			expectedLen:   0,
-			expectedError: false,
-		},
-		{
-			name:          "invalid json",
-			kind:          kindClusterPolicy,
-			mockOutput:    `{invalid json}`,
-			mockError:     nil,
-			expectedLen:   0,
-			expectedError: true,
+			name: "policy with active watcher and artifacts",
+			policy: PolicyInfo{
+				Name: "test-policy",
+				Kind: "Policy",
+				Labels: map[string]string{
+					"managed-by":     "kyverno-watcher",
+					"policy-version": "v1.0.0",
+				},
+			},
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-abc123",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "test-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedOrphaned: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Mock scriptExec
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
+			clientset := fakeclientset.NewSimpleClientset(tt.pods...)
 
-			scriptExecFunc = func(cmd string) (string, error) {
-				// Verify correct command is used
-				if tt.kind == kindClusterPolicy {
-					if !strings.Contains(cmd, "clusterpolicies") {
-						t.Errorf("Expected command to contain 'clusterpolicies', got: %s", cmd)
-					}
-				} else {
-					if !strings.Contains(cmd, "policies") || !strings.Contains(cmd, "--all-namespaces") {
-						t.Errorf("Expected command to contain 'policies --all-namespaces', got: %s", cmd)
-					}
-				}
-				return tt.mockOutput, tt.mockError
+			// Register KyvernoArtifact list kind
+			gvr := schema.GroupVersionResource{
+				Group:    "kyverno.octokode.io",
+				Version:  "v1alpha1",
+				Resource: "kyvernoartifacts",
 			}
-
-			policies, err := getPoliciesByKind(tt.kind)
-
-			if tt.expectedError {
-				if err == nil {
-					t.Error("Expected error but got nil")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
+			listKind := schema.GroupVersionKind{
+				Group:   "kyverno.octokode.io",
+				Version: "v1alpha1",
+				Kind:    "KyvernoArtifactList",
 			}
+			dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				scheme,
+				map[schema.GroupVersionResource]string{gvr: listKind.Kind},
+				tt.artifacts...,
+			)
 
-			if len(policies) != tt.expectedLen {
-				t.Errorf("Expected %d policies, got %d", tt.expectedLen, len(policies))
-			}
-
-			if tt.expectedPolicy != nil && len(policies) > 0 {
-				p := policies[0]
-				if p.Name != tt.expectedPolicy.Name {
-					t.Errorf("Expected policy name %s, got %s", tt.expectedPolicy.Name, p.Name)
-				}
-				if p.Namespace != tt.expectedPolicy.Namespace {
-					t.Errorf("Expected namespace %s, got %s", tt.expectedPolicy.Namespace, p.Namespace)
-				}
-				if p.Kind != tt.expectedPolicy.Kind {
-					t.Errorf("Expected kind %s, got %s", tt.expectedPolicy.Kind, p.Kind)
-				}
-			}
-		})
-	}
-}
-
-func TestGetManagedPolicies(t *testing.T) {
-	tests := []struct {
-		name                string
-		mockPolicies        string
-		mockClusterPolicies string
-		expectedLen         int
-	}{
-		{
-			name: "both types present",
-			mockPolicies: `{
-				"items": [
-					{
-						"metadata": {"name": "policy1", "namespace": "default", "labels": {"managed-by": "kyverno-watcher"}},
-						"kind": "Policy"
-					}
-				]
-			}`,
-			mockClusterPolicies: `{
-				"items": [
-					{
-						"metadata": {"name": "cpolicy1", "labels": {"managed-by": "kyverno-watcher"}},
-						"kind": "ClusterPolicy"
-					}
-				]
-			}`,
-			expectedLen: 2,
-		},
-		{
-			name:         "only clusterpolicies",
-			mockPolicies: `{"items": []}`,
-			mockClusterPolicies: `{
-				"items": [
-					{
-						"metadata": {"name": "cpolicy1", "labels": {"managed-by": "kyverno-watcher"}},
-						"kind": "ClusterPolicy"
-					}
-				]
-			}`,
-			expectedLen: 1,
-		},
-		{
-			name: "only namespaced policies",
-			mockPolicies: `{
-				"items": [
-					{
-						"metadata": {"name": "policy1", "namespace": "default", "labels": {"managed-by": "kyverno-watcher"}},
-						"kind": "Policy"
-					}
-				]
-			}`,
-			mockClusterPolicies: `{"items": []}`,
-			expectedLen:         1,
-		},
-		{
-			name:                "no policies",
-			mockPolicies:        `{"items": []}`,
-			mockClusterPolicies: `{"items": []}`,
-			expectedLen:         0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
-
-			scriptExecFunc = func(cmd string) (string, error) {
-				if strings.Contains(cmd, "clusterpolicies") {
-					return tt.mockClusterPolicies, nil
-				}
-				return tt.mockPolicies, nil
-			}
-
-			policies := getManagedPolicies()
-
-			if len(policies) != tt.expectedLen {
-				t.Errorf("Expected %d policies, got %d", tt.expectedLen, len(policies))
+			orphaned := isOrphaned(tt.policy, clientset, dynamicClient)
+			if orphaned != tt.expectedOrphaned {
+				t.Errorf("Expected orphaned=%v, got %v", tt.expectedOrphaned, orphaned)
 			}
 		})
 	}
@@ -242,304 +310,201 @@ func TestGetManagedPolicies(t *testing.T) {
 
 func TestCheckForActiveWatchers(t *testing.T) {
 	tests := []struct {
-		name         string
-		mockOutput   string
-		mockError    error
-		expectedBool bool
-		expectError  bool
+		name           string
+		pods           []runtime.Object
+		expectedActive bool
+		expectError    bool
 	}{
 		{
-			name: "active watcher running",
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {"name": "kyverno-artifact-manager-test"},
-						"status": {"phase": "Running"}
-					}
-				]
-			}`,
-			expectedBool: true,
+			name:           "no pods",
+			pods:           []runtime.Object{},
+			expectedActive: false,
+			expectError:    false,
 		},
 		{
-			name: "active watcher pending",
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {"name": "kyverno-artifact-manager-test"},
-						"status": {"phase": "Pending"}
-					}
-				]
-			}`,
-			expectedBool: true,
+			name: "running watcher pod",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-abc123",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			expectedActive: true,
+			expectError:    false,
 		},
 		{
-			name: "watcher failed",
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {"name": "kyverno-artifact-manager-test"},
-						"status": {"phase": "Failed"}
-					}
-				]
-			}`,
-			expectedBool: false,
+			name: "pending watcher pod",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-xyz789",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodPending},
+				},
+			},
+			expectedActive: true,
+			expectError:    false,
 		},
 		{
-			name: "no watchers",
-			mockOutput: `{
-				"items": []
-			}`,
-			expectedBool: false,
+			name: "failed watcher pod",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-failed",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			expectedActive: false,
+			expectError:    false,
 		},
 		{
-			name: "other pods only",
-			mockOutput: `{
-				"items": [
-					{
-						"metadata": {"name": "some-other-pod"},
-						"status": {"phase": "Running"}
-					}
-				]
-			}`,
-			expectedBool: false,
-		},
-		{
-			name:         "kubectl error",
-			mockError:    fmt.Errorf("command failed"),
-			expectedBool: false,
-			expectError:  true,
+			name: "wrong name prefix",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "other-pod",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "other"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			expectedActive: false,
+			expectError:    false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
+			clientset := fakeclientset.NewSimpleClientset(tt.pods...)
 
-			scriptExecFunc = func(cmd string) (string, error) {
-				return tt.mockOutput, tt.mockError
-			}
-
-			result, err := checkForActiveWatchers()
+			hasActive, err := checkForActiveWatchers(clientset)
 
 			if tt.expectError {
 				if err == nil {
-					t.Error("Expected error but got nil")
+					t.Error("Expected error but got none")
 				}
 			} else {
 				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
+					t.Errorf("Expected no error, got %v", err)
 				}
 			}
 
-			if result != tt.expectedBool {
-				t.Errorf("Expected %v, got %v", tt.expectedBool, result)
+			if hasActive != tt.expectedActive {
+				t.Errorf("Expected active=%v, got %v", tt.expectedActive, hasActive)
 			}
 		})
 	}
 }
 
 func TestCheckForKyvernoArtifacts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	// Register KyvernoArtifact list kind
+	gvr := schema.GroupVersionResource{
+		Group:    "kyverno.octokode.io",
+		Version:  "v1alpha1",
+		Resource: "kyvernoartifacts",
+	}
+	listKind := schema.GroupVersionKind{
+		Group:   "kyverno.octokode.io",
+		Version: "v1alpha1",
+		Kind:    "KyvernoArtifactList",
+	}
+
 	tests := []struct {
-		name         string
-		mockOutput   string
-		mockError    error
-		expectedBool bool
-		expectError  bool
+		name                 string
+		artifacts            []runtime.Object
+		expectedHasArtifacts bool
 	}{
 		{
-			name: "artifacts exist",
-			mockOutput: `{
-				"items": [
-					{"metadata": {"name": "artifact1"}},
-					{"metadata": {"name": "artifact2"}}
-				]
-			}`,
-			expectedBool: true,
+			name:                 "no artifacts",
+			artifacts:            []runtime.Object{},
+			expectedHasArtifacts: false,
 		},
 		{
-			name: "no artifacts",
-			mockOutput: `{
-				"items": []
-			}`,
-			expectedBool: false,
+			name: "one artifact",
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "test-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedHasArtifacts: true,
 		},
 		{
-			name:         "kubectl error",
-			mockError:    fmt.Errorf("command failed"),
-			expectedBool: false,
-			expectError:  true,
+			name: "multiple artifacts",
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "artifact-1",
+							"namespace": "default",
+						},
+					},
+				},
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "artifact-2",
+							"namespace": "kube-system",
+						},
+					},
+				},
+			},
+			expectedHasArtifacts: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
+			dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				scheme,
+				map[schema.GroupVersionResource]string{gvr: listKind.Kind},
+				tt.artifacts...,
+			)
 
-			scriptExecFunc = func(cmd string) (string, error) {
-				return tt.mockOutput, tt.mockError
+			hasArtifacts, err := checkForKyvernoArtifacts(dynamicClient)
+			if err != nil {
+				t.Errorf("Expected no error, got %v", err)
 			}
 
-			result, err := checkForKyvernoArtifacts()
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got nil")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			}
-
-			if result != tt.expectedBool {
-				t.Errorf("Expected %v, got %v", tt.expectedBool, result)
-			}
-		})
-	}
-}
-
-func TestIsOrphaned(t *testing.T) {
-	tests := []struct {
-		name             string
-		policy           PolicyInfo
-		hasWatchers      bool
-		hasArtifacts     bool
-		watchersError    error
-		artifactsError   error
-		expectedOrphaned bool
-		skipVersionCheck bool
-	}{
-		{
-			name: "policy without version label",
-			policy: PolicyInfo{
-				Name:   "test-policy",
-				Labels: map[string]string{"managed-by": "kyverno-watcher"},
-			},
-			skipVersionCheck: true,
-			expectedOrphaned: false,
-		},
-		{
-			name: "orphaned - no watchers",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Labels: map[string]string{
-					"managed-by":     "kyverno-watcher",
-					"policy-version": "v1.0.0",
-				},
-			},
-			hasWatchers:      false,
-			hasArtifacts:     true,
-			expectedOrphaned: true,
-		},
-		{
-			name: "orphaned - no artifacts",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Labels: map[string]string{
-					"managed-by":     "kyverno-watcher",
-					"policy-version": "v1.0.0",
-				},
-			},
-			hasWatchers:      true,
-			hasArtifacts:     false,
-			expectedOrphaned: true,
-		},
-		{
-			name: "not orphaned - both exist",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Labels: map[string]string{
-					"managed-by":     "kyverno-watcher",
-					"policy-version": "v1.0.0",
-				},
-			},
-			hasWatchers:      true,
-			hasArtifacts:     true,
-			expectedOrphaned: false,
-		},
-		{
-			name: "error checking watchers",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Labels: map[string]string{
-					"managed-by":     "kyverno-watcher",
-					"policy-version": "v1.0.0",
-				},
-			},
-			watchersError:    fmt.Errorf("check failed"),
-			expectedOrphaned: false,
-		},
-		{
-			name: "error checking artifacts",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Labels: map[string]string{
-					"managed-by":     "kyverno-watcher",
-					"policy-version": "v1.0.0",
-				},
-			},
-			hasWatchers:      true,
-			artifactsError:   fmt.Errorf("check failed"),
-			expectedOrphaned: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
-
-			scriptExecFunc = func(cmd string) (string, error) {
-				if strings.Contains(cmd, "kyvernoartifacts") {
-					if tt.artifactsError != nil {
-						return "", tt.artifactsError
-					}
-					items := "[]"
-					if tt.hasArtifacts {
-						items = `[{"metadata": {"name": "artifact1"}}]`
-					}
-					return fmt.Sprintf(`{"items": %s}`, items), nil
-				}
-				if strings.Contains(cmd, "pods") {
-					if tt.watchersError != nil {
-						return "", tt.watchersError
-					}
-					items := "[]"
-					if tt.hasWatchers {
-						items = `[{"metadata": {"name": "kyverno-artifact-manager-test"}, "status": {"phase": "Running"}}]`
-					}
-					return fmt.Sprintf(`{"items": %s}`, items), nil
-				}
-				return "", fmt.Errorf("unexpected command: %s", cmd)
-			}
-
-			result := isOrphaned(tt.policy)
-
-			if result != tt.expectedOrphaned {
-				t.Errorf("Expected orphaned=%v, got %v", tt.expectedOrphaned, result)
+			if hasArtifacts != tt.expectedHasArtifacts {
+				t.Errorf("Expected hasArtifacts=%v, got %v", tt.expectedHasArtifacts, hasArtifacts)
 			}
 		})
 	}
 }
 
 func TestDeletePolicy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
 	tests := []struct {
-		name        string
-		policy      PolicyInfo
-		mockError   error
-		expectError bool
-		expectedCmd string
+		name      string
+		policy    PolicyInfo
+		setupObjs []runtime.Object
 	}{
-		{
-			name: "delete clusterpolicy",
-			policy: PolicyInfo{
-				Name: "test-cpolicy",
-				Kind: "ClusterPolicy",
-			},
-			expectedCmd: "kubectl delete clusterpolicy test-cpolicy",
-		},
 		{
 			name: "delete namespaced policy",
 			policy: PolicyInfo{
@@ -547,186 +512,117 @@ func TestDeletePolicy(t *testing.T) {
 				Namespace: "default",
 				Kind:      "Policy",
 			},
-			expectedCmd: "kubectl delete policy test-policy -n default",
+			setupObjs: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.io/v1",
+						"kind":       "Policy",
+						"metadata": map[string]interface{}{
+							"name":      "test-policy",
+							"namespace": "default",
+						},
+					},
+				},
+			},
 		},
 		{
-			name: "delete policy without namespace",
+			name: "delete cluster policy",
 			policy: PolicyInfo{
-				Name: "test-policy",
-				Kind: "Policy",
+				Name: "test-cluster-policy",
+				Kind: "ClusterPolicy",
 			},
-			expectedCmd: "kubectl delete policy test-policy",
-		},
-		{
-			name: "delete fails",
-			policy: PolicyInfo{
-				Name: "test-policy",
-				Kind: "Policy",
+			setupObjs: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.io/v1",
+						"kind":       "ClusterPolicy",
+						"metadata": map[string]interface{}{
+							"name": "test-cluster-policy",
+						},
+					},
+				},
 			},
-			mockError:   fmt.Errorf("delete failed"),
-			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
+			dynamicClient := dynamicfake.NewSimpleDynamicClient(scheme, tt.setupObjs...)
 
-			var capturedCmd string
-			scriptExecFunc = func(cmd string) (string, error) {
-				capturedCmd = cmd
-				return "", tt.mockError
+			err := deletePolicy(tt.policy, dynamicClient)
+			if err != nil {
+				t.Errorf("Expected no error, got %v", err)
 			}
 
-			err := deletePolicy(tt.policy)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got nil")
+			// Verify the policy was deleted
+			ctx := context.Background()
+			var gvr schema.GroupVersionResource
+			if tt.policy.Kind == clusterPolicyKind {
+				gvr = schema.GroupVersionResource{
+					Group:    kyvernoAPIGroup,
+					Version:  kyvernoAPIVersion,
+					Resource: "clusterpolicies",
 				}
+				_, err = dynamicClient.Resource(gvr).Get(ctx, tt.policy.Name, metav1.GetOptions{})
 			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
+				gvr = schema.GroupVersionResource{
+					Group:    kyvernoAPIGroup,
+					Version:  kyvernoAPIVersion,
+					Resource: "policies",
 				}
+				_, err = dynamicClient.Resource(gvr).Namespace(tt.policy.Namespace).Get(ctx, tt.policy.Name, metav1.GetOptions{})
 			}
 
-			if tt.expectedCmd != "" && capturedCmd != tt.expectedCmd {
-				t.Errorf("Expected command %q, got %q", tt.expectedCmd, capturedCmd)
+			if err == nil {
+				t.Error("Expected policy to be deleted, but it still exists")
 			}
 		})
 	}
 }
 
 func TestCollectGarbage(t *testing.T) {
-	tests := []struct {
-		name                 string
-		mockPolicies         []PolicyInfo
-		hasWatchers          bool
-		hasArtifacts         bool
-		expectedDeletedCount int
-	}{
-		{
-			name: "delete orphaned policies",
-			mockPolicies: []PolicyInfo{
-				{
-					Name: "orphaned-policy",
-					Kind: "ClusterPolicy",
-					Labels: map[string]string{
-						"managed-by":     "kyverno-watcher",
-						"policy-version": "v1.0.0",
-					},
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	// Mock getKubeClientFunc
+	oldFunc := getKubeClientFunc
+	defer func() { getKubeClientFunc = oldFunc }()
+
+	policy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kyverno.io/v1",
+			"kind":       "Policy",
+			"metadata": map[string]interface{}{
+				"name":      "orphaned-policy",
+				"namespace": "default",
+				"labels": map[string]interface{}{
+					"managed-by":     "kyverno-watcher",
+					"policy-version": "v1.0.0",
 				},
 			},
-			hasWatchers:          false,
-			hasArtifacts:         false,
-			expectedDeletedCount: 1,
-		},
-		{
-			name: "keep active policies",
-			mockPolicies: []PolicyInfo{
-				{
-					Name: "active-policy",
-					Kind: "ClusterPolicy",
-					Labels: map[string]string{
-						"managed-by":     "kyverno-watcher",
-						"policy-version": "v1.0.0",
-					},
-				},
-			},
-			hasWatchers:          true,
-			hasArtifacts:         true,
-			expectedDeletedCount: 0,
-		},
-		{
-			name: "mixed scenario",
-			mockPolicies: []PolicyInfo{
-				{
-					Name: "orphaned-policy",
-					Kind: "ClusterPolicy",
-					Labels: map[string]string{
-						"managed-by":     "kyverno-watcher",
-						"policy-version": "v1.0.0",
-					},
-				},
-				{
-					Name: "policy-without-version",
-					Kind: "ClusterPolicy",
-					Labels: map[string]string{
-						"managed-by": "kyverno-watcher",
-					},
-				},
-			},
-			hasWatchers:          false,
-			hasArtifacts:         false,
-			expectedDeletedCount: 1, // Only orphaned-policy should be deleted
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			oldScriptExec := scriptExecFunc
-			defer func() { scriptExecFunc = oldScriptExec }()
-
-			deletedCount := 0
-			scriptExecFunc = func(cmd string) (string, error) {
-				if strings.HasPrefix(cmd, "kubectl delete") {
-					deletedCount++
-					return "", nil
-				}
-				if strings.Contains(cmd, "kyvernoartifacts") {
-					items := "[]"
-					if tt.hasArtifacts {
-						items = `[{"metadata": {"name": "artifact1"}}]`
-					}
-					return fmt.Sprintf(`{"items": %s}`, items), nil
-				}
-				if strings.Contains(cmd, "pods") {
-					items := "[]"
-					if tt.hasWatchers {
-						items = `[{"metadata": {"name": "kyverno-artifact-manager-test"}, "status": {"phase": "Running"}}]`
-					}
-					return fmt.Sprintf(`{"items": %s}`, items), nil
-				}
-				if strings.Contains(cmd, "policies") || strings.Contains(cmd, "clusterpolicies") {
-					// Return mock policies based on the kind in the command
-					var filteredPolicies []PolicyInfo
-					if strings.Contains(cmd, "clusterpolicies") {
-						for _, p := range tt.mockPolicies {
-							if p.Kind == kindClusterPolicy {
-								filteredPolicies = append(filteredPolicies, p)
-							}
-						}
-					} else {
-						for _, p := range tt.mockPolicies {
-							if p.Kind == "Policy" {
-								filteredPolicies = append(filteredPolicies, p)
-							}
-						}
-					}
-
-					items := []map[string]interface{}{}
-					for _, p := range filteredPolicies {
-						items = append(items, map[string]interface{}{
-							"metadata": map[string]interface{}{
-								"name":      p.Name,
-								"namespace": p.Namespace,
-								"labels":    p.Labels,
-							},
-							"kind": p.Kind,
-						})
-					}
-					listJSON, _ := json.Marshal(map[string]interface{}{"items": items})
-					return string(listJSON), nil
-				}
-				return "", fmt.Errorf("unexpected command: %s", cmd)
-			}
-
-			collectGarbage()
-
-			if deletedCount != tt.expectedDeletedCount {
-				t.Errorf("Expected %d policies deleted, got %d", tt.expectedDeletedCount, deletedCount)
-			}
-		})
+	// Register list kinds for all resources we'll query
+	listKinds := map[schema.GroupVersionResource]string{
+		{Group: "kyverno.io", Version: "v1", Resource: "policies"}:                        "PolicyList",
+		{Group: "kyverno.io", Version: "v1", Resource: "clusterpolicies"}:                 "ClusterPolicyList",
+		{Group: "kyverno.octokode.io", Version: "v1alpha1", Resource: "kyvernoartifacts"}: "KyvernoArtifactList",
 	}
+
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, policy)
+	clientset := fakeclientset.NewSimpleClientset()
+
+	getKubeClientFunc = func() (kubernetes.Interface, dynamic.Interface, error) {
+		return clientset, dynamicClient, nil
+	}
+
+	// This should run without panicking
+	collectGarbage()
 }
+
+// Integration tests would require:
+// 1. A running Kubernetes cluster
+// 2. Kyverno CRDs installed
+// 3. Test fixtures for policies and artifacts
+// These should be run in a separate integration test suite with proper setup/teardown

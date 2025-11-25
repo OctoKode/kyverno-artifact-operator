@@ -12,11 +12,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitfield/script"
+	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	orasremote "oras.land/oras-go/v2/registry/remote"
@@ -700,19 +704,95 @@ func applyManifestsReal(config *Config, dir string) error {
 
 	log.Printf("Applying manifests in %s ...\n", dir)
 
+	// Get Kubernetes client
+	kubeConfig, err := k8s.GetConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
 	for _, f := range files {
-		log.Printf("kubectl apply -f %s\n", f)
+		log.Printf("Applying %s\n", f)
 
-		p := script.Exec(fmt.Sprintf("kubectl apply -f %s", f)).
-			WithStdout(os.Stdout).
-			WithStderr(os.Stderr)
+		if err := applyManifestFile(f, dynamicClient); err != nil {
+			log.Printf("Failed to apply %s: %v\n", f, err)
+			// Continue with other files even if one fails
+			continue
+		}
 
-		exitCode := p.ExitStatus()
-		if exitCode != 0 {
-			log.Printf("kubectl apply failed for %s with exit code %d\n", f, exitCode)
+		log.Printf("Successfully applied %s\n", f)
+	}
+
+	return nil
+}
+
+// applyManifestFile reads a YAML file and applies it to the cluster
+func applyManifestFile(filePath string, dynamicClient dynamic.Interface) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Parse YAML to unstructured
+	obj := &unstructured.Unstructured{}
+	if err := yaml.Unmarshal(data, obj); err != nil {
+		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+
+	// Get GVR from the object
+	gvk := obj.GroupVersionKind()
+	gvr := schema.GroupVersionResource{
+		Group:    gvk.Group,
+		Version:  gvk.Version,
+		Resource: strings.ToLower(gvk.Kind) + "s", // Simple pluralization
+	}
+
+	ctx := context.Background()
+	namespace := obj.GetNamespace()
+
+	// Try to create or update the resource
+	var result interface{}
+	if namespace != "" {
+		// Namespaced resource
+		existing, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if err != nil {
+			// Resource doesn't exist, create it
+			result, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+		} else {
+			// Resource exists, update it
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			result, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update resource: %w", err)
+			}
+		}
+	} else {
+		// Cluster-scoped resource
+		existing, err := dynamicClient.Resource(gvr).Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if err != nil {
+			// Resource doesn't exist, create it
+			result, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+		} else {
+			// Resource exists, update it
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			result, err = dynamicClient.Resource(gvr).Update(ctx, obj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update resource: %w", err)
+			}
 		}
 	}
 
+	_ = result // Suppress unused variable warning
 	return nil
 }
 

@@ -1,20 +1,26 @@
 package gc
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
-	"github.com/bitfield/script"
+	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 )
 
 var (
 	// Version is set via ldflags during build
 	Version = "dev"
-	// scriptExecFunc can be overridden in tests
-	scriptExecFunc = scriptExec
+	// getKubeClientFunc can be overridden in tests
+	getKubeClientFunc = k8s.GetClient
 )
 
 // PolicyInfo holds basic policy information
@@ -41,18 +47,25 @@ func Run(version string, pollInterval int) {
 func collectGarbage() {
 	log.Println("Starting garbage collection cycle...")
 
+	// Get Kubernetes clients
+	clientset, dynamicClient, err := getKubeClientFunc()
+	if err != nil {
+		log.Printf("Error getting Kubernetes clients: %v\n", err)
+		return
+	}
+
 	// Get all policies with managed-by=kyverno-watcher label
-	policies := getManagedPolicies()
+	policies := getManagedPolicies(dynamicClient)
 
 	log.Printf("Found %d managed policies to check\n", len(policies))
 
 	orphanedCount := 0
 	for _, policy := range policies {
-		if isOrphaned(policy) {
+		if isOrphaned(policy, clientset, dynamicClient) {
 			log.Printf("Found orphaned policy: %s (namespace: %s, kind: %s)\n",
 				policy.Name, policy.Namespace, policy.Kind)
 
-			if err := deletePolicy(policy); err != nil {
+			if err := deletePolicy(policy, dynamicClient); err != nil {
 				log.Printf("Error deleting orphaned policy %s: %v\n", policy.Name, err)
 				continue
 			}
@@ -70,11 +83,24 @@ func collectGarbage() {
 }
 
 // getManagedPolicies returns all Policy and ClusterPolicy resources with managed-by=kyverno-watcher label
-func getManagedPolicies() []PolicyInfo {
+func getManagedPolicies(dynamicClient dynamic.Interface) []PolicyInfo {
 	policies := make([]PolicyInfo, 0)
+	ctx := context.Background()
+
+	// Define GVRs for Kyverno policies
+	policyGVR := schema.GroupVersionResource{
+		Group:    "kyverno.io",
+		Version:  "v1",
+		Resource: "policies",
+	}
+	clusterPolicyGVR := schema.GroupVersionResource{
+		Group:    "kyverno.io",
+		Version:  "v1",
+		Resource: "clusterpolicies",
+	}
 
 	// Get namespaced Policies
-	namespacedPolicies, err := getPoliciesByKind("Policy")
+	namespacedPolicies, err := getPoliciesByKind(ctx, dynamicClient, policyGVR, "")
 	if err != nil {
 		log.Printf("Warning: failed to list Policy resources: %v\n", err)
 	} else {
@@ -82,7 +108,7 @@ func getManagedPolicies() []PolicyInfo {
 	}
 
 	// Get ClusterPolicies
-	clusterPolicies, err := getPoliciesByKind("ClusterPolicy")
+	clusterPolicies, err := getPoliciesByKind(ctx, dynamicClient, clusterPolicyGVR, "")
 	if err != nil {
 		log.Printf("Warning: failed to list ClusterPolicy resources: %v\n", err)
 	} else {
@@ -93,44 +119,44 @@ func getManagedPolicies() []PolicyInfo {
 }
 
 // getPoliciesByKind retrieves policies of a specific kind with the managed-by label
-func getPoliciesByKind(kind string) ([]PolicyInfo, error) {
-	// Build kubectl command to get policies with the label
-	var cmd string
-	if kind == "ClusterPolicy" {
-		cmd = "kubectl get clusterpolicies -l managed-by=kyverno-watcher -o json"
+func getPoliciesByKind(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, namespace string) ([]PolicyInfo, error) {
+	labelSelector := "managed-by=kyverno-watcher"
+
+	var list interface{}
+	var err error
+
+	if namespace == "" {
+		// List across all namespaces
+		list, err = dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
 	} else {
-		cmd = "kubectl get policies --all-namespaces -l managed-by=kyverno-watcher -o json"
+		list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
 	}
 
-	// Execute kubectl command
-	result, err := scriptExecFunc(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("kubectl get failed: %w", err)
+		return nil, fmt.Errorf("failed to list %s: %w", gvr.Resource, err)
 	}
 
-	// Parse JSON response
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Name      string            `json:"name"`
-				Namespace string            `json:"namespace,omitempty"`
-				Labels    map[string]string `json:"labels,omitempty"`
-			} `json:"metadata"`
-			Kind string `json:"kind"`
-		} `json:"items"`
+	unstructuredList, ok := list.(*unstructured.UnstructuredList)
+	if !ok {
+		return nil, fmt.Errorf("unexpected list type")
 	}
 
-	if err := json.Unmarshal([]byte(result), &list); err != nil {
-		return nil, fmt.Errorf("failed to parse kubectl output: %w", err)
-	}
+	policies := make([]PolicyInfo, 0, len(unstructuredList.Items))
+	for _, item := range unstructuredList.Items {
+		kind := "Policy"
+		if gvr.Resource == "clusterpolicies" {
+			kind = "ClusterPolicy"
+		}
 
-	policies := make([]PolicyInfo, 0, len(list.Items))
-	for _, item := range list.Items {
 		policies = append(policies, PolicyInfo{
-			Name:      item.Metadata.Name,
-			Namespace: item.Metadata.Namespace,
+			Name:      item.GetName(),
+			Namespace: item.GetNamespace(),
 			Kind:      kind,
-			Labels:    item.Metadata.Labels,
+			Labels:    item.GetLabels(),
 		})
 	}
 
@@ -138,7 +164,7 @@ func getPoliciesByKind(kind string) ([]PolicyInfo, error) {
 }
 
 // isOrphaned checks if a policy is orphaned (KyvernoArtifact and pod are gone)
-func isOrphaned(policy PolicyInfo) bool {
+func isOrphaned(policy PolicyInfo, clientset kubernetes.Interface, dynamicClient dynamic.Interface) bool {
 	policyVersion, hasVersion := policy.Labels["policy-version"]
 	if !hasVersion {
 		log.Printf("Policy %s has no policy-version label, skipping\n", policy.Name)
@@ -146,7 +172,7 @@ func isOrphaned(policy PolicyInfo) bool {
 	}
 
 	// Check if any KyvernoArtifact exists that could own this policy
-	hasActiveWatcher, err := checkForActiveWatchers()
+	hasActiveWatcher, err := checkForActiveWatchers(clientset)
 	if err != nil {
 		log.Printf("Warning: failed to check for active watchers: %v\n", err)
 		return false
@@ -159,7 +185,7 @@ func isOrphaned(policy PolicyInfo) bool {
 	}
 
 	// Check if there's a KyvernoArtifact that could have created this policy
-	hasKyvernoArtifact, err := checkForKyvernoArtifacts()
+	hasKyvernoArtifact, err := checkForKyvernoArtifacts(dynamicClient)
 	if err != nil {
 		log.Printf("Warning: failed to check for KyvernoArtifacts: %v\n", err)
 		return false
@@ -176,32 +202,20 @@ func isOrphaned(policy PolicyInfo) bool {
 }
 
 // checkForActiveWatchers checks if there are any active watcher pods
-func checkForActiveWatchers() (bool, error) {
-	result, err := scriptExecFunc("kubectl get pods --all-namespaces -l app -o json")
+func checkForActiveWatchers(clientset kubernetes.Interface) (bool, error) {
+	ctx := context.Background()
+
+	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		LabelSelector: "app",
+	})
 	if err != nil {
-		return false, fmt.Errorf("kubectl get pods failed: %w", err)
-	}
-
-	var podList struct {
-		Items []struct {
-			Metadata struct {
-				Name   string            `json:"name"`
-				Labels map[string]string `json:"labels,omitempty"`
-			} `json:"metadata"`
-			Status struct {
-				Phase string `json:"phase"`
-			} `json:"status"`
-		} `json:"items"`
-	}
-
-	if err := json.Unmarshal([]byte(result), &podList); err != nil {
-		return false, fmt.Errorf("failed to parse pod list: %w", err)
+		return false, fmt.Errorf("failed to list pods: %w", err)
 	}
 
 	// Check for pods with names starting with "kyverno-artifact-manager-"
-	for _, pod := range podList.Items {
-		if strings.HasPrefix(pod.Metadata.Name, "kyverno-artifact-manager-") &&
-			(pod.Status.Phase == "Running" || pod.Status.Phase == "Pending") {
+	for _, pod := range pods.Items {
+		if strings.HasPrefix(pod.Name, "kyverno-artifact-manager-") &&
+			(pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending) {
 			return true, nil
 		}
 	}
@@ -210,45 +224,53 @@ func checkForActiveWatchers() (bool, error) {
 }
 
 // checkForKyvernoArtifacts checks if there are any KyvernoArtifact resources
-func checkForKyvernoArtifacts() (bool, error) {
-	result, err := scriptExecFunc("kubectl get kyvernoartifacts --all-namespaces -o json")
+func checkForKyvernoArtifacts(dynamicClient dynamic.Interface) (bool, error) {
+	ctx := context.Background()
+
+	artifactGVR := schema.GroupVersionResource{
+		Group:    "kyverno.octokode.io",
+		Version:  "v1alpha1",
+		Resource: "kyvernoartifacts",
+	}
+
+	list, err := dynamicClient.Resource(artifactGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return false, fmt.Errorf("kubectl get kyvernoartifacts failed: %w", err)
+		return false, fmt.Errorf("failed to list kyvernoartifacts: %w", err)
 	}
 
-	var artifactList struct {
-		Items []interface{} `json:"items"`
-	}
-
-	if err := json.Unmarshal([]byte(result), &artifactList); err != nil {
-		return false, fmt.Errorf("failed to parse artifact list: %w", err)
-	}
-
-	return len(artifactList.Items) > 0, nil
+	return len(list.Items) > 0, nil
 }
 
 // deletePolicy deletes a policy resource
-func deletePolicy(policy PolicyInfo) error {
-	var cmd string
+func deletePolicy(policy PolicyInfo, dynamicClient dynamic.Interface) error {
+	ctx := context.Background()
+
+	var gvr schema.GroupVersionResource
 	if policy.Kind == "ClusterPolicy" {
-		cmd = fmt.Sprintf("kubectl delete clusterpolicy %s", policy.Name)
+		gvr = schema.GroupVersionResource{
+			Group:    "kyverno.io",
+			Version:  "v1",
+			Resource: "clusterpolicies",
+		}
 	} else {
-		if policy.Namespace != "" {
-			cmd = fmt.Sprintf("kubectl delete policy %s -n %s", policy.Name, policy.Namespace)
-		} else {
-			cmd = fmt.Sprintf("kubectl delete policy %s", policy.Name)
+		gvr = schema.GroupVersionResource{
+			Group:    "kyverno.io",
+			Version:  "v1",
+			Resource: "policies",
 		}
 	}
 
-	_, err := scriptExecFunc(cmd)
-	if err != nil {
-		return fmt.Errorf("kubectl delete failed: %w", err)
+	if policy.Namespace != "" {
+		err := dynamicClient.Resource(gvr).Namespace(policy.Namespace).Delete(ctx, policy.Name, metav1.DeleteOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to delete policy: %w", err)
+		}
+	} else {
+		err := dynamicClient.Resource(gvr).Delete(ctx, policy.Name, metav1.DeleteOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to delete clusterpolicy: %w", err)
+		}
 	}
 
 	return nil
-}
-
-// scriptExec is a wrapper around script.Exec for easier testing
-func scriptExec(cmd string) (string, error) {
-	return script.Exec(cmd).String()
 }
