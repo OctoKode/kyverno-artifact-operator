@@ -78,6 +78,7 @@ type Config struct {
 	Provider           string
 	Username           string
 	Password           string
+	ArtifactName       string // Name of the KyvernoArtifact resource that owns this watcher
 }
 
 type GitHubPackageVersion struct {
@@ -176,6 +177,17 @@ func loadConfig() *Config {
 	pollInterval := getEnvAsIntOrDefault("POLL_INTERVAL", 30)
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
 
+	// Get artifact name from pod name (format: kyverno-artifact-manager-{artifactName})
+	// This is used to link policies back to their source KyvernoArtifact for garbage collection
+	artifactName := getEnvFunc("ARTIFACT_NAME")
+	if artifactName == "" {
+		// Try to extract from hostname/pod name as fallback
+		hostname := getEnvFunc("HOSTNAME")
+		if strings.HasPrefix(hostname, "kyverno-artifact-manager-") {
+			artifactName = strings.TrimPrefix(hostname, "kyverno-artifact-manager-")
+		}
+	}
+
 	// Normalize package name for API path
 	packageNormalized := strings.ReplaceAll(packageName, "/", "%2F")
 
@@ -198,6 +210,7 @@ func loadConfig() *Config {
 		Provider:           provider,
 		Username:           username,
 		Password:           password,
+		ArtifactName:       artifactName,
 	}
 }
 
@@ -465,7 +478,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 	}
 
 	for _, f := range files {
-		if err := addLabelsToManifest(f, tag); err != nil {
+		if err := addLabelsToManifest(f, tag, config.ArtifactName); err != nil {
 			log.Printf("Warning: failed to add labels to %s: %v\n", f, err)
 			// Don't fail - continue with other files
 			continue
@@ -547,14 +560,14 @@ func orasPull(config *Config, destDir string) error {
 	return nil
 }
 
-func addLabelsToManifest(filePath, tag string) error {
+func addLabelsToManifest(filePath, tag, artifactName string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("reading file: %w", err)
 	}
 
 	// Add labels to the YAML content
-	updatedData, err := addLabelsToYAML(data, tag)
+	updatedData, err := addLabelsToYAML(data, tag, artifactName)
 	if err != nil {
 		return fmt.Errorf("adding labels: %w", err)
 	}
@@ -567,7 +580,7 @@ func addLabelsToManifest(filePath, tag string) error {
 	return nil
 }
 
-func addLabelsToYAML(yamlData []byte, tag string) ([]byte, error) {
+func addLabelsToYAML(yamlData []byte, tag, artifactName string) ([]byte, error) {
 	var manifest Manifest
 	if err := yaml.Unmarshal(yamlData, &manifest); err != nil {
 		return nil, fmt.Errorf("unmarshaling YAML: %w", err)
@@ -581,6 +594,9 @@ func addLabelsToYAML(yamlData []byte, tag string) ([]byte, error) {
 	// Add our labels
 	manifest.Metadata.Labels["managed-by"] = "kyverno-watcher"
 	manifest.Metadata.Labels["policy-version"] = tag
+	if artifactName != "" {
+		manifest.Metadata.Labels["artifact-name"] = artifactName
+	}
 
 	// Marshal back to YAML
 	updatedData, err := yaml.Marshal(&manifest)

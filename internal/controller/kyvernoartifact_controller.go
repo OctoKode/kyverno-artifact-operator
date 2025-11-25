@@ -141,6 +141,10 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Name:  "PROVIDER",
 				Value: provider,
 			},
+			{
+				Name:  "ARTIFACT_NAME",
+				Value: kyvernoArtifact.Name,
+			},
 		}
 
 		// Add provider-specific credentials
