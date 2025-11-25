@@ -62,6 +62,7 @@ func collectGarbage() {
 	log.Printf("Found %d managed policies to check\n", len(policies))
 
 	orphanedCount := 0
+	pendingCount := 0
 	for _, policy := range policies {
 		policyKey := getPolicyKey(policy)
 
@@ -72,6 +73,7 @@ func collectGarbage() {
 				orphanedPolicies[policyKey] = time.Now()
 				log.Printf("Found orphaned policy: %s (namespace: %s, kind: %s) - will wait one cycle before deletion\n",
 					policy.Name, policy.Namespace, policy.Kind)
+				pendingCount++
 				continue
 			}
 
@@ -109,6 +111,8 @@ func collectGarbage() {
 
 	if orphanedCount > 0 {
 		log.Printf("Garbage collection complete: deleted %d orphaned policies\n", orphanedCount)
+	} else if pendingCount > 0 {
+		log.Printf("Garbage collection complete: %d orphaned policies in grace period, waiting before deletion\n", pendingCount)
 	} else {
 		log.Println("Garbage collection complete: no orphaned policies found")
 	}
