@@ -17,11 +17,14 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/restmapper"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	orasremote "oras.land/oras-go/v2/registry/remote"
@@ -732,10 +735,25 @@ func applyManifestsReal(config *Config, dir string) error {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	// Create discovery client to get REST mapper for proper GVK to GVR conversion
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
+	}
+
+	// Get API group resources for the REST mapper
+	apiGroupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
+	if err != nil {
+		return fmt.Errorf("failed to get API group resources: %w", err)
+	}
+
+	// Create REST mapper that can properly pluralize resource names
+	mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
+
 	for _, f := range files {
 		log.Printf("Applying %s\n", f)
 
-		if err := applyManifestFile(f, dynamicClient); err != nil {
+		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
 			log.Printf("Failed to apply %s: %v\n", f, err)
 			// Continue with other files even if one fails
 			continue
@@ -749,7 +767,7 @@ func applyManifestsReal(config *Config, dir string) error {
 
 // applyManifestFile reads a YAML file and applies it to the cluster.
 // It supports multi-document YAML files (documents separated by ---).
-func applyManifestFile(filePath string, dynamicClient dynamic.Interface) error {
+func applyManifestFile(filePath string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
@@ -774,7 +792,7 @@ func applyManifestFile(filePath string, dynamicClient dynamic.Interface) error {
 			continue
 		}
 
-		if err := applyResource(obj, dynamicClient); err != nil {
+		if err := applyResource(obj, dynamicClient, mapper); err != nil {
 			return fmt.Errorf("failed to apply document %d: %w", docIndex, err)
 		}
 
@@ -785,14 +803,14 @@ func applyManifestFile(filePath string, dynamicClient dynamic.Interface) error {
 }
 
 // applyResource applies a single unstructured resource to the cluster
-func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interface) error {
-	// Get GVR from the object
+func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
+	// Get GVR from the object using the REST mapper for proper pluralization
 	gvk := obj.GroupVersionKind()
-	gvr := schema.GroupVersionResource{
-		Group:    gvk.Group,
-		Version:  gvk.Version,
-		Resource: strings.ToLower(gvk.Kind) + "s", // Simple pluralization
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return fmt.Errorf("failed to get REST mapping for %s: %w", gvk.String(), err)
 	}
+	gvr := mapping.Resource
 
 	ctx := context.Background()
 	namespace := obj.GetNamespace()
