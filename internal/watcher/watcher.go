@@ -12,11 +12,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bitfield/script"
+	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/restmapper"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	orasremote "oras.land/oras-go/v2/registry/remote"
@@ -74,6 +81,7 @@ type Config struct {
 	Provider           string
 	Username           string
 	Password           string
+	ArtifactName       string // Name of the KyvernoArtifact resource that owns this watcher
 }
 
 type GitHubPackageVersion struct {
@@ -172,6 +180,17 @@ func loadConfig() *Config {
 	pollInterval := getEnvAsIntOrDefault("POLL_INTERVAL", 30)
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
 
+	// Get artifact name from pod name (format: kyverno-artifact-manager-{artifactName})
+	// This is used to link policies back to their source KyvernoArtifact for garbage collection
+	artifactName := getEnvFunc("ARTIFACT_NAME")
+	if artifactName == "" {
+		// Try to extract from hostname/pod name as fallback
+		hostname := getEnvFunc("HOSTNAME")
+		if strings.HasPrefix(hostname, "kyverno-artifact-manager-") {
+			artifactName = strings.TrimPrefix(hostname, "kyverno-artifact-manager-")
+		}
+	}
+
 	// Normalize package name for API path
 	packageNormalized := strings.ReplaceAll(packageName, "/", "%2F")
 
@@ -194,6 +213,7 @@ func loadConfig() *Config {
 		Provider:           provider,
 		Username:           username,
 		Password:           password,
+		ArtifactName:       artifactName,
 	}
 }
 
@@ -461,7 +481,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 	}
 
 	for _, f := range files {
-		if err := addLabelsToManifest(f, tag); err != nil {
+		if err := addLabelsToManifest(f, tag, config.ArtifactName); err != nil {
 			log.Printf("Warning: failed to add labels to %s: %v\n", f, err)
 			// Don't fail - continue with other files
 			continue
@@ -543,14 +563,14 @@ func orasPull(config *Config, destDir string) error {
 	return nil
 }
 
-func addLabelsToManifest(filePath, tag string) error {
+func addLabelsToManifest(filePath, tag, artifactName string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("reading file: %w", err)
 	}
 
 	// Add labels to the YAML content
-	updatedData, err := addLabelsToYAML(data, tag)
+	updatedData, err := addLabelsToYAML(data, tag, artifactName)
 	if err != nil {
 		return fmt.Errorf("adding labels: %w", err)
 	}
@@ -563,7 +583,7 @@ func addLabelsToManifest(filePath, tag string) error {
 	return nil
 }
 
-func addLabelsToYAML(yamlData []byte, tag string) ([]byte, error) {
+func addLabelsToYAML(yamlData []byte, tag, artifactName string) ([]byte, error) {
 	var manifest Manifest
 	if err := yaml.Unmarshal(yamlData, &manifest); err != nil {
 		return nil, fmt.Errorf("unmarshaling YAML: %w", err)
@@ -577,6 +597,9 @@ func addLabelsToYAML(yamlData []byte, tag string) ([]byte, error) {
 	// Add our labels
 	manifest.Metadata.Labels["managed-by"] = "kyverno-watcher"
 	manifest.Metadata.Labels["policy-version"] = tag
+	if artifactName != "" {
+		manifest.Metadata.Labels["artifact-name"] = artifactName
+	}
 
 	// Marshal back to YAML
 	updatedData, err := yaml.Marshal(&manifest)
@@ -700,16 +723,131 @@ func applyManifestsReal(config *Config, dir string) error {
 
 	log.Printf("Applying manifests in %s ...\n", dir)
 
+	// Get Kubernetes client
+	kubeConfig, err := k8s.GetConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Create discovery client to get REST mapper for proper GVK to GVR conversion
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
+	}
+
+	// Get API group resources for the REST mapper
+	apiGroupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
+	if err != nil {
+		return fmt.Errorf("failed to get API group resources: %w", err)
+	}
+
+	// Create REST mapper that can properly pluralize resource names
+	mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
+
 	for _, f := range files {
-		log.Printf("kubectl apply -f %s\n", f)
+		log.Printf("Applying %s\n", f)
 
-		p := script.Exec(fmt.Sprintf("kubectl apply -f %s", f)).
-			WithStdout(os.Stdout).
-			WithStderr(os.Stderr)
+		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
+			log.Printf("Failed to apply %s: %v\n", f, err)
+			// Continue with other files even if one fails
+			continue
+		}
 
-		exitCode := p.ExitStatus()
-		if exitCode != 0 {
-			log.Printf("kubectl apply failed for %s with exit code %d\n", f, exitCode)
+		log.Printf("Successfully applied %s\n", f)
+	}
+
+	return nil
+}
+
+// applyManifestFile reads a YAML file and applies it to the cluster.
+// It supports multi-document YAML files (documents separated by ---).
+func applyManifestFile(filePath string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	decoder := k8syaml.NewYAMLOrJSONDecoder(f, 4096)
+	docIndex := 0
+
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to decode YAML document %d: %w", docIndex, err)
+		}
+
+		// Skip empty documents (e.g., documents with only comments or whitespace)
+		if len(obj.Object) == 0 {
+			docIndex++
+			continue
+		}
+
+		if err := applyResource(obj, dynamicClient, mapper); err != nil {
+			return fmt.Errorf("failed to apply document %d: %w", docIndex, err)
+		}
+
+		docIndex++
+	}
+
+	return nil
+}
+
+// applyResource applies a single unstructured resource to the cluster
+func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
+	// Get GVR from the object using the REST mapper for proper pluralization
+	gvk := obj.GroupVersionKind()
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return fmt.Errorf("failed to get REST mapping for resource pluralization of %s: %w", gvk.String(), err)
+	}
+	gvr := mapping.Resource
+
+	ctx := context.Background()
+	namespace := obj.GetNamespace()
+
+	// Try to create or update the resource
+	if namespace != "" {
+		// Namespaced resource
+		existing, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if err != nil {
+			// Resource doesn't exist, create it
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+		} else {
+			// Resource exists, update it
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update resource: %w", err)
+			}
+		}
+	} else {
+		// Cluster-scoped resource
+		existing, err := dynamicClient.Resource(gvr).Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if err != nil {
+			// Resource doesn't exist, create it
+			_, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+		} else {
+			// Resource exists, update it
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			_, err = dynamicClient.Resource(gvr).Update(ctx, obj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update resource: %w", err)
+			}
 		}
 	}
 

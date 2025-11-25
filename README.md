@@ -6,14 +6,16 @@ Kubernetes operator that automatically syncs Kyverno policies from OCI artifacts
 
 The Kyverno Artifact Operator watches OCI artifacts for changes and automatically applies Kyverno policies to your Kubernetes cluster. When you push a new version of your policy artifact, the operator detects the change, pulls the new policies, and applies them to your cluster.
 
-This repository combines both the operator and watcher functionality into a single binary that can operate in two modes:
+This repository combines both the operator and watcher functionality into a single binary that can operate in three modes:
 - **Operator mode** (default): Manages KyvernoArtifact custom resources and deploys watcher pods
 - **Watcher mode** (`-watcher` flag): Continuously monitors OCI registries for policy updates
+- **Garbage Collector mode** (`gc` or `--garbage-collect` flag): Cleans up orphaned policies
 
 **Features:**
 - Automatic policy synchronization from OCI registries
 - Support for GitHub Container Registry (GHCR) and Artifactory
 - Configurable polling intervals
+- Automatic cleanup of orphaned policies with managed-by labels
 - Secure token management via Kubernetes secrets
 - Prometheus metrics for monitoring
 
@@ -133,7 +135,7 @@ kubectl set env deployment/kyverno-artifact-operator-controller-manager \
 
 ### Binary Modes
 
-The `manager` binary can run in two modes:
+The `manager` binary can run in three modes:
 
 ```bash
 # Operator mode (default) - manages KyvernoArtifact CRDs
@@ -141,7 +143,14 @@ The `manager` binary can run in two modes:
 
 # Watcher mode - directly monitors OCI registry for changes
 ./bin/manager -watcher
+
+# Garbage Collector mode - cleans up orphaned policies
+./bin/manager gc
+# or
+./bin/manager --garbage-collect
 ```
+
+#### Watcher Mode
 
 When running in watcher mode, the binary requires these environment variables:
 - `IMAGE_BASE`: OCI image reference (e.g., `ghcr.io/owner/package`)
@@ -149,6 +158,40 @@ When running in watcher mode, the binary requires these environment variables:
 - `GITHUB_TOKEN`: GitHub token (for GitHub provider)
 - `ARTIFACTORY_USERNAME` and `ARTIFACTORY_PASSWORD`: Credentials (for Artifactory provider)
 - `POLL_INTERVAL`: Poll interval in seconds (default: 30)
+
+#### Garbage Collector Mode
+
+The garbage collector mode cleans up orphaned Kyverno policies that have the `managed-by: kyverno-watcher` label but no longer have a corresponding KyvernoArtifact or watcher pod. This is useful for cleaning up policies after deleting KyvernoArtifact resources.
+
+Configuration:
+- `POLL_INTERVAL`: Poll interval in seconds between garbage collection cycles (default: 30)
+
+The garbage collector will:
+1. Find all Policy and ClusterPolicy resources with `managed-by=kyverno-watcher` label
+2. Check if there are any active KyvernoArtifact resources
+3. Check if there are any active watcher pods
+4. Delete policies that are orphaned (no KyvernoArtifact or watcher pod exists)
+5. Sleep for the configured polling interval and repeat
+
+To deploy as a standalone pod:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kyverno-policy-gc
+  namespace: kyverno-artifact-operator-system
+spec:
+  serviceAccountName: kyverno-artifact-operator-watcher
+  containers:
+  - name: gc
+    image: ghcr.io/octokode/kyverno-artifact-operator:latest
+    args: ["gc"]
+    env:
+    - name: POLL_INTERVAL
+      value: "300"  # 5 minutes
+  restartPolicy: Always
+```
 
 ### Prerequisites
 - go version v1.24.0+
