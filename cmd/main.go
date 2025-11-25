@@ -66,7 +66,7 @@ func main() {
 	watcherMode := false
 	gcMode := false
 	for _, arg := range os.Args[1:] {
-		if arg == "-watcher" || arg == "--watcher" {
+		if arg == "watcher" || arg == "-watcher" || arg == "--watcher" {
 			watcherMode = true
 			break
 		}

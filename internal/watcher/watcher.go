@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
 	"oras.land/oras-go/v2"
@@ -740,17 +741,22 @@ func applyManifestsReal(config *Config, dir string) error {
 		return fmt.Errorf("failed to create discovery client: %w", err)
 	}
 
-	// Get API group resources for the REST mapper
-	apiGroupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
-	if err != nil {
-		return fmt.Errorf("failed to get API group resources: %w", err)
-	}
-
-	// Create REST mapper that can properly pluralize resource names
-	mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
-
 	for _, f := range files {
 		log.Printf("Applying %s\n", f)
+
+		// Create a fresh cached discovery client for each file to ensure we fetch the latest CRDs
+		// This invalidates any cached API resources and queries the API server again
+		cachedClient := memory.NewMemCacheClient(discoveryClient)
+
+		// Refresh API group resources for each file to ensure we have the latest CRDs
+		apiGroupResources, err := restmapper.GetAPIGroupResources(cachedClient)
+		if err != nil {
+			log.Printf("Warning: failed to get API group resources for %s: %v\n", f, err)
+			continue
+		}
+
+		// Create a fresh REST mapper for each file to pick up newly installed CRDs
+		mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
 
 		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
 			log.Printf("Failed to apply %s: %v\n", f, err)
@@ -807,7 +813,7 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 	gvk := obj.GroupVersionKind()
 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
-		return fmt.Errorf("failed to get REST mapping for resource pluralization of %s: %w", gvk.String(), err)
+		return fmt.Errorf("failed to get REST mapping for %s (CRD may not be installed): %w", gvk.String(), err)
 	}
 	gvr := mapping.Resource
 

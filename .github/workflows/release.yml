@@ -125,16 +125,12 @@ jobs:
           mkdir -p dist
 
           # Build for multiple platforms
-          for OS in linux darwin windows; do
+          for OS in linux darwin; do
             for ARCH in amd64 arm64; do
-              EXT=""
-              if [ "$OS" = "windows" ]; then
-                EXT=".exe"
-              fi
               echo "Building for $OS/$ARCH..."
               GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build \
                 -ldflags "-X main.version=${VERSION}" \
-                -o "dist/kyverno-artifact-operator-${OS}-${ARCH}${EXT}" \
+                -o "dist/kyverno-artifact-operator-${OS}-${ARCH}" \
                 ./cmd/main.go
             done
           done
