@@ -815,20 +815,19 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 	namespace := obj.GetNamespace()
 
 	// Try to create or update the resource
-	var result interface{}
 	if namespace != "" {
 		// Namespaced resource
 		existing, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
 		if err != nil {
 			// Resource doesn't exist, create it
-			result, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to create resource: %w", err)
 			}
 		} else {
 			// Resource exists, update it
 			obj.SetResourceVersion(existing.GetResourceVersion())
-			result, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to update resource: %w", err)
 			}
@@ -838,21 +837,20 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 		existing, err := dynamicClient.Resource(gvr).Get(ctx, obj.GetName(), metav1.GetOptions{})
 		if err != nil {
 			// Resource doesn't exist, create it
-			result, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+			_, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to create resource: %w", err)
 			}
 		} else {
 			// Resource exists, update it
 			obj.SetResourceVersion(existing.GetResourceVersion())
-			result, err = dynamicClient.Resource(gvr).Update(ctx, obj, metav1.UpdateOptions{})
+			_, err = dynamicClient.Resource(gvr).Update(ctx, obj, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to update resource: %w", err)
 			}
 		}
 	}
 
-	_ = result // Suppress unused variable warning
 	return nil
 }
 
