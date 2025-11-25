@@ -808,7 +808,7 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 	gvk := obj.GroupVersionKind()
 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
-		return fmt.Errorf("failed to get REST mapping for %s: %w", gvk.String(), err)
+		return fmt.Errorf("failed to get REST mapping for resource pluralization of %s: %w", gvk.String(), err)
 	}
 	gvr := mapping.Resource
 
