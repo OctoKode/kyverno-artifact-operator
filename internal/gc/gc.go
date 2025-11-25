@@ -292,7 +292,7 @@ func checkForActiveWatchers(clientset kubernetes.Interface) (bool, error) {
 	ctx := context.Background()
 
 	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		LabelSelector: "app",
+		LabelSelector: "app=kyverno-artifact-manager",
 	})
 	if err != nil {
 		return false, fmt.Errorf("failed to list pods: %w", err)
