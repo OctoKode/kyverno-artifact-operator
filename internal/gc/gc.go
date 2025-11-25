@@ -252,8 +252,8 @@ func checkForSpecificWatcher(clientset kubernetes.Interface, artifactName string
 	}
 
 	for _, pod := range pods.Items {
-		// Pod names are exactly "kyverno-artifact-manager-{artifactName}"
-		if pod.Name == expectedPodPrefix &&
+		// Pod names start with "kyverno-artifact-manager-{artifactName}" (may have a generated suffix)
+		if strings.HasPrefix(pod.Name, expectedPodPrefix) &&
 			(pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending) {
 			return true, nil
 		}
