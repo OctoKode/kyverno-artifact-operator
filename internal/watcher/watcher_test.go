@@ -931,7 +931,7 @@ metadata:
 
 			// Parse the result back to check labels
 			var manifest Manifest
-			if err := yamlUnmarshal(result, &manifest); err != nil {
+			if err := yaml.Unmarshal(result, &manifest); err != nil {
 				t.Fatalf("Failed to parse result YAML: %v", err)
 			}
 
@@ -954,9 +954,4 @@ metadata:
 			}
 		})
 	}
-}
-
-// yamlUnmarshal wraps yaml.Unmarshal for testing
-func yamlUnmarshal(data []byte, v interface{}) error {
-	return yaml.Unmarshal(data, v)
 }
