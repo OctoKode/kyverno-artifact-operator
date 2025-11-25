@@ -163,7 +163,7 @@ func getPoliciesByKind(ctx context.Context, dynamicClient dynamic.Interface, gvr
 	return policies, nil
 }
 
-// isOrphaned checks if a policy is orphaned (KyvernoArtifact and pod are gone)
+// isOrphaned checks if a policy is orphaned (its specific KyvernoArtifact or watcher pod are gone)
 func isOrphaned(policy PolicyInfo, clientset kubernetes.Interface, dynamicClient dynamic.Interface) bool {
 	policyVersion, hasVersion := policy.Labels["policy-version"]
 	if !hasVersion {
@@ -171,6 +171,46 @@ func isOrphaned(policy PolicyInfo, clientset kubernetes.Interface, dynamicClient
 		return false
 	}
 
+	// Get the artifact name that owns this policy
+	artifactName, hasArtifactName := policy.Labels["artifact-name"]
+	if !hasArtifactName {
+		// For backward compatibility, if no artifact-name label, fall back to global check
+		log.Printf("Policy %s has no artifact-name label, using legacy orphan check\n", policy.Name)
+		return isOrphanedLegacy(policy, policyVersion, clientset, dynamicClient)
+	}
+
+	// Check if the specific KyvernoArtifact exists
+	hasKyvernoArtifact, err := checkForSpecificKyvernoArtifact(dynamicClient, artifactName)
+	if err != nil {
+		log.Printf("Warning: failed to check for KyvernoArtifact %s: %v\n", artifactName, err)
+		return false
+	}
+
+	if !hasKyvernoArtifact {
+		log.Printf("Policy %s (version: %s) appears orphaned: KyvernoArtifact %s not found\n",
+			policy.Name, policyVersion, artifactName)
+		return true
+	}
+
+	// Check if the specific watcher pod exists for this artifact
+	hasActiveWatcher, err := checkForSpecificWatcher(clientset, artifactName)
+	if err != nil {
+		log.Printf("Warning: failed to check for watcher pod for artifact %s: %v\n", artifactName, err)
+		return false
+	}
+
+	if !hasActiveWatcher {
+		log.Printf("Policy %s (version: %s) appears orphaned: no active watcher pod for artifact %s\n",
+			policy.Name, policyVersion, artifactName)
+		return true
+	}
+
+	// The specific KyvernoArtifact and watcher exist
+	return false
+}
+
+// isOrphanedLegacy checks for orphaned policies without artifact-name label (backward compatibility)
+func isOrphanedLegacy(policy PolicyInfo, policyVersion string, clientset kubernetes.Interface, dynamicClient dynamic.Interface) bool {
 	// Check if any KyvernoArtifact exists that could own this policy
 	hasActiveWatcher, err := checkForActiveWatchers(clientset)
 	if err != nil {
@@ -199,6 +239,52 @@ func isOrphaned(policy PolicyInfo, clientset kubernetes.Interface, dynamicClient
 
 	// If we have both watchers and artifacts, assume the policy is not orphaned
 	return false
+}
+
+// checkForSpecificWatcher checks if the watcher pod for a specific artifact exists and is active
+func checkForSpecificWatcher(clientset kubernetes.Interface, artifactName string) (bool, error) {
+	ctx := context.Background()
+	expectedPodPrefix := fmt.Sprintf("kyverno-artifact-manager-%s", artifactName)
+
+	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	for _, pod := range pods.Items {
+		// Pod names are exactly "kyverno-artifact-manager-{artifactName}"
+		if pod.Name == expectedPodPrefix &&
+			(pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// checkForSpecificKyvernoArtifact checks if a specific KyvernoArtifact exists
+func checkForSpecificKyvernoArtifact(dynamicClient dynamic.Interface, artifactName string) (bool, error) {
+	ctx := context.Background()
+
+	artifactGVR := schema.GroupVersionResource{
+		Group:    "kyverno.octokode.io",
+		Version:  "v1alpha1",
+		Resource: "kyvernoartifacts",
+	}
+
+	// Check across all namespaces for the specific artifact
+	list, err := dynamicClient.Resource(artifactGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list kyvernoartifacts: %w", err)
+	}
+
+	for _, item := range list.Items {
+		if item.GetName() == artifactName {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // checkForActiveWatchers checks if there are any active watcher pods

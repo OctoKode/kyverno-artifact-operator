@@ -208,7 +208,7 @@ func TestIsOrphaned(t *testing.T) {
 			expectedOrphaned: false,
 		},
 		{
-			name: "policy with no active watchers",
+			name: "legacy policy with no active watchers",
 			policy: PolicyInfo{
 				Name: "test-policy",
 				Kind: "Policy",
@@ -221,7 +221,7 @@ func TestIsOrphaned(t *testing.T) {
 			expectedOrphaned: true,
 		},
 		{
-			name: "policy with active watcher but no artifacts",
+			name: "legacy policy with active watcher but no artifacts",
 			policy: PolicyInfo{
 				Name: "test-policy",
 				Kind: "Policy",
@@ -244,7 +244,7 @@ func TestIsOrphaned(t *testing.T) {
 			expectedOrphaned: true,
 		},
 		{
-			name: "policy with active watcher and artifacts",
+			name: "legacy policy with active watcher and artifacts",
 			policy: PolicyInfo{
 				Name: "test-policy",
 				Kind: "Policy",
@@ -276,6 +276,105 @@ func TestIsOrphaned(t *testing.T) {
 				},
 			},
 			expectedOrphaned: false,
+		},
+		// New test cases for specific artifact tracking
+		{
+			name: "policy with artifact-name label and matching artifact exists",
+			policy: PolicyInfo{
+				Name: "test-policy",
+				Kind: "Policy",
+				Labels: map[string]string{
+					"managed-by":     "kyverno-watcher",
+					"policy-version": "v1.0.0",
+					"artifact-name":  "my-artifact",
+				},
+			},
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-my-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-my-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "my-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedOrphaned: false,
+		},
+		{
+			name: "policy with artifact-name label but artifact deleted",
+			policy: PolicyInfo{
+				Name: "test-policy",
+				Kind: "Policy",
+				Labels: map[string]string{
+					"managed-by":     "kyverno-watcher",
+					"policy-version": "v1.0.0",
+					"artifact-name":  "deleted-artifact",
+				},
+			},
+			pods: []runtime.Object{
+				// Other watcher pods exist but not for this artifact
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-other-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-other-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			artifacts: []runtime.Object{
+				// Other artifacts exist but not the one we're looking for
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "other-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedOrphaned: true, // Should be orphaned because its specific artifact is gone
+		},
+		{
+			name: "policy with artifact-name label but watcher pod is missing",
+			policy: PolicyInfo{
+				Name: "test-policy",
+				Kind: "Policy",
+				Labels: map[string]string{
+					"managed-by":     "kyverno-watcher",
+					"policy-version": "v1.0.0",
+					"artifact-name":  "my-artifact",
+				},
+			},
+			pods: []runtime.Object{}, // No pods at all
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "my-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedOrphaned: true, // Artifact exists but watcher pod is gone
 		},
 	}
 
@@ -491,6 +590,221 @@ func TestCheckForKyvernoArtifacts(t *testing.T) {
 
 			if hasArtifacts != tt.expectedHasArtifacts {
 				t.Errorf("Expected hasArtifacts=%v, got %v", tt.expectedHasArtifacts, hasArtifacts)
+			}
+		})
+	}
+}
+
+func TestCheckForSpecificWatcher(t *testing.T) {
+	tests := []struct {
+		name           string
+		artifactName   string
+		pods           []runtime.Object
+		expectedActive bool
+		expectError    bool
+	}{
+		{
+			name:           "no pods",
+			artifactName:   "my-artifact",
+			pods:           []runtime.Object{},
+			expectedActive: false,
+			expectError:    false,
+		},
+		{
+			name:         "matching running watcher pod",
+			artifactName: "my-artifact",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-my-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-my-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			expectedActive: true,
+			expectError:    false,
+		},
+		{
+			name:         "matching pending watcher pod",
+			artifactName: "my-artifact",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-my-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-my-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodPending},
+				},
+			},
+			expectedActive: true,
+			expectError:    false,
+		},
+		{
+			name:         "matching failed watcher pod",
+			artifactName: "my-artifact",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-my-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-my-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			expectedActive: false, // Failed pods are not active
+			expectError:    false,
+		},
+		{
+			name:         "other watcher pod exists but not the one we're looking for",
+			artifactName: "my-artifact",
+			pods: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kyverno-artifact-manager-other-artifact",
+						Namespace: "default",
+						Labels:    map[string]string{"app": "kyverno-artifact-manager-other-artifact"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			expectedActive: false, // Wrong artifact name
+			expectError:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fakeclientset.NewSimpleClientset(tt.pods...)
+
+			hasActive, err := checkForSpecificWatcher(clientset, tt.artifactName)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Expected no error, got %v", err)
+				}
+			}
+
+			if hasActive != tt.expectedActive {
+				t.Errorf("Expected active=%v, got %v", tt.expectedActive, hasActive)
+			}
+		})
+	}
+}
+
+func TestCheckForSpecificKyvernoArtifact(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	// Register KyvernoArtifact list kind
+	gvr := schema.GroupVersionResource{
+		Group:    "kyverno.octokode.io",
+		Version:  "v1alpha1",
+		Resource: "kyvernoartifacts",
+	}
+	listKind := schema.GroupVersionKind{
+		Group:   "kyverno.octokode.io",
+		Version: "v1alpha1",
+		Kind:    "KyvernoArtifactList",
+	}
+
+	tests := []struct {
+		name         string
+		artifactName string
+		artifacts    []runtime.Object
+		expectedHas  bool
+	}{
+		{
+			name:         "no artifacts",
+			artifactName: "my-artifact",
+			artifacts:    []runtime.Object{},
+			expectedHas:  false,
+		},
+		{
+			name:         "matching artifact exists",
+			artifactName: "my-artifact",
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "my-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedHas: true,
+		},
+		{
+			name:         "other artifacts exist but not the one we're looking for",
+			artifactName: "my-artifact",
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "other-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+			},
+			expectedHas: false,
+		},
+		{
+			name:         "multiple artifacts including the one we're looking for",
+			artifactName: "my-artifact",
+			artifacts: []runtime.Object{
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "other-artifact",
+							"namespace": "default",
+						},
+					},
+				},
+				&unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "kyverno.octokode.io/v1alpha1",
+						"kind":       "KyvernoArtifact",
+						"metadata": map[string]interface{}{
+							"name":      "my-artifact",
+							"namespace": "kube-system",
+						},
+					},
+				},
+			},
+			expectedHas: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				scheme,
+				map[schema.GroupVersionResource]string{gvr: listKind.Kind},
+				tt.artifacts...,
+			)
+
+			hasArtifact, err := checkForSpecificKyvernoArtifact(dynamicClient, tt.artifactName)
+			if err != nil {
+				t.Errorf("Expected no error, got %v", err)
+			}
+
+			if hasArtifact != tt.expectedHas {
+				t.Errorf("Expected hasArtifact=%v, got %v", tt.expectedHas, hasArtifact)
 			}
 		})
 	}
