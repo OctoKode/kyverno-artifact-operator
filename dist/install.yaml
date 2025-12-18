@@ -230,6 +230,7 @@ rules:
   - clusterpolicies
   - policies
   verbs:
+  - delete
   - get
   - list
   - watch
