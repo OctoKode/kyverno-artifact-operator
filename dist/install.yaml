@@ -225,6 +225,15 @@ rules:
   - update
   - watch
 - apiGroups:
+  - kyverno.io
+  resources:
+  - clusterpolicies
+  - policies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - kyverno.octokode.io
   resources:
   - kyvernoartifacts
@@ -333,8 +342,6 @@ spec:
       control-plane: controller-manager
   template:
     metadata:
-      annotations:
-        kubectl.kubernetes.io/default-container: manager
       labels:
         app.kubernetes.io/name: kyverno-artifact-operator
         control-plane: controller-manager

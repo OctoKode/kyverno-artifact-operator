@@ -17,6 +17,15 @@ rules:
   - update
   - watch
 - apiGroups:
+  - kyverno.io
+  resources:
+  - clusterpolicies
+  - policies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - kyverno.octokode.io
   resources:
   - kyvernoartifacts
