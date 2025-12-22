@@ -8,8 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -103,6 +106,24 @@ func Run(version string) {
 
 	config := loadConfig()
 
+	// Set up signal handling for graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		<-c
+		log.Println("Received termination signal, cleaning up policies...")
+		kubeConfig, err := k8s.GetConfig()
+		if err != nil {
+			log.Fatalf("Error getting Kubernetes config for cleanup: %v", err)
+		}
+		dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+		if err != nil {
+			log.Fatalf("Error creating dynamic client for cleanup: %v", err)
+		}
+		cleanupPolicies(config, dynamicClient)
+		os.Exit(0)
+	}()
+
 	if config.Provider == ProviderGitHub {
 		log.Printf("Starting GHCR watcher for %s (owner=%s, package=%s)\n",
 			config.ImageBase, config.Owner, config.Package)
@@ -116,6 +137,73 @@ func Run(version string) {
 		}
 		time.Sleep(time.Duration(config.PollInterval) * time.Second)
 	}
+}
+
+// cleanupPolicies deletes all policies and clusterpolicies associated with this watcher
+func cleanupPolicies(config *Config, dynamicClient dynamic.Interface) {
+	log.Println("Cleaning up policies...")
+
+	labelSelector := fmt.Sprintf("artifact-name=%s", config.ArtifactName)
+
+	// Define GVRs for Kyverno policies
+	policyGVR := schema.GroupVersionResource{
+		Group:    "kyverno.io",
+		Version:  "v1",
+		Resource: "policies",
+	}
+	clusterPolicyGVR := schema.GroupVersionResource{
+		Group:    "kyverno.io",
+		Version:  "v1",
+		Resource: "clusterpolicies",
+	}
+
+	// Delete namespaced Policies
+	if err := deleteResourcesByLabel(dynamicClient, policyGVR, "", labelSelector); err != nil {
+		log.Printf("Warning: failed to delete Policy resources: %v\n", err)
+	}
+
+	// Delete ClusterPolicies
+	if err := deleteResourcesByLabel(dynamicClient, clusterPolicyGVR, "", labelSelector); err != nil {
+		log.Printf("Warning: failed to delete ClusterPolicy resources: %v\n", err)
+	}
+
+	log.Println("Policy cleanup complete.")
+}
+
+// deleteResourcesByLabel deletes all resources of a specific kind matching the label selector
+func deleteResourcesByLabel(dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, namespace string, labelSelector string) error {
+	ctx := context.Background()
+
+	var list *unstructured.UnstructuredList
+	var err error
+
+	if namespace == "" {
+		// List across all namespaces
+		list, err = dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+	} else {
+		list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+	}
+	if err != nil {
+		return fmt.Errorf("failed to list %s: %w", gvr.Resource, err)
+	}
+
+	for _, item := range list.Items {
+		log.Printf("Deleting %s %s...\n", item.GetKind(), item.GetName())
+		if namespace != "" {
+			err = dynamicClient.Resource(gvr).Namespace(namespace).Delete(ctx, item.GetName(), metav1.DeleteOptions{})
+		} else {
+			err = dynamicClient.Resource(gvr).Delete(ctx, item.GetName(), metav1.DeleteOptions{})
+		}
+		if err != nil {
+			log.Printf("Failed to delete %s %s: %v\n", item.GetKind(), item.GetName(), err)
+		}
+	}
+
+	return nil
 }
 
 // getEnvFunc can be overridden in tests
@@ -666,6 +754,7 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 	log.Printf("Layer %d media type: %s\n", layerIndex, mediaType)
 
 	// Get layer content
+
 	blob, err := layer.Compressed()
 	if err != nil {
 		return fmt.Errorf("getting compressed layer: %w", err)
@@ -777,7 +866,9 @@ func applyManifestFile(filePath string, dynamicClient dynamic.Interface, mapper 
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	decoder := k8syaml.NewYAMLOrJSONDecoder(f, 4096)
 	docIndex := 0
