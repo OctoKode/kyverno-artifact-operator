@@ -19,12 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -36,42 +34,6 @@ import (
 const (
 	providerGitHub = "github"
 )
-
-// Config holds configurable values for the controller
-type Config struct {
-	WatcherImage           string
-	WatcherServiceAccount  string
-	SecretName             string
-	GitHubTokenKey         string
-	ArtifactoryUsernameKey string
-	ArtifactoryPasswordKey string
-}
-
-// DefaultConfig returns the default configuration
-func DefaultConfig() Config {
-	return Config{
-		WatcherImage:           getEnvOrDefault("WATCHER_IMAGE", "ghcr.io/octokode/kyverno-artifact-operator:latest"),
-		WatcherServiceAccount:  getEnvOrDefault("WATCHER_SERVICE_ACCOUNT", "kyverno-artifact-operator-watcher"),
-		SecretName:             getEnvOrDefault("WATCHER_SECRET_NAME", "kyverno-watcher-secret"),
-		GitHubTokenKey:         getEnvOrDefault("GITHUB_TOKEN_KEY", "github-token"),
-		ArtifactoryUsernameKey: getEnvOrDefault("ARTIFACTORY_USERNAME_KEY", "artifactory-username"),
-		ArtifactoryPasswordKey: getEnvOrDefault("ARTIFACTORY_PASSWORD_KEY", "artifactory-password"),
-	}
-}
-
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// KyvernoArtifactReconciler reconciles a KyvernoArtifact object
-type KyvernoArtifactReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-	Config Config
-}
 
 // +kubebuilder:rbac:groups=kyverno.octokode.io,resources=kyvernoartifacts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kyverno.octokode.io,resources=kyvernoartifacts/status,verbs=get;update;patch

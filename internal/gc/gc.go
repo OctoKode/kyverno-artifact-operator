@@ -25,14 +25,6 @@ var (
 	orphanedPolicies = make(map[string]time.Time)
 )
 
-// PolicyInfo holds basic policy information
-type PolicyInfo struct {
-	Name      string
-	Namespace string
-	Kind      string
-	Labels    map[string]string
-}
-
 // Run starts the garbage collector for orphaned policies
 func Run(version string, pollInterval int) {
 	Version = version

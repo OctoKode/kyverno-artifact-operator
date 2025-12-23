@@ -11,14 +11,6 @@ This repository combines both the operator and watcher functionality into a sing
 - **Watcher mode** (`-watcher` flag): Continuously monitors OCI registries for policy updates
 - **Garbage Collector mode** (`gc` or `--garbage-collect` flag): Cleans up orphaned policies
 
-**Features:**
-- Automatic policy synchronization from OCI registries
-- Support for GitHub Container Registry (GHCR) and Artifactory
-- Configurable polling intervals
-- Automatic cleanup of orphaned policies with managed-by labels
-- Secure token management via Kubernetes secrets
-- Prometheus metrics for monitoring
-
 ## Quick Start
 
 ### 1. Install the Operator
@@ -62,6 +54,10 @@ spec:
   type: oci
   provider: github
   pollingInterval: 60
+  # deletePoliciesOnTermination specifies whether policies created by this artifact should be automatically deleted when the watcher pod terminates.
+  # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.
+  # +optional
+  deletePoliciesOnTermination: true
 ```
 
 #### For Artifactory:
@@ -76,6 +72,10 @@ spec:
   type: oci
   provider: artifactory
   pollingInterval: 60
+  # deletePoliciesOnTermination specifies whether policies created by this artifact should be automatically deleted when the watcher pod terminates.
+  # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.
+  # +optional
+  deletePoliciesOnTermination: true
 ```
 
 ```bash
@@ -115,14 +115,7 @@ For detailed troubleshooting, see [config/samples/README.md](config/samples/READ
 
 ## Configuration
 
-The operator can be customized via environment variables. This is particularly useful for Helm deployments or when using different registry credentials.
-
-See [docs/configuration.md](docs/configuration.md) for detailed configuration options, including:
-- Custom watcher images
-- Custom secret names and keys
-- Service account configuration
-- Multi-tenant deployments
-
+See [docs/configuration.md](docs/configuration.md) for detailed configuration options.
 **Quick example** - Configure custom secret name:
 
 ```bash
@@ -172,149 +165,3 @@ The garbage collector will:
 3. Check if there are any active watcher pods
 4. Delete policies that are orphaned (no KyvernoArtifact or watcher pod exists)
 5. Sleep for the configured polling interval and repeat
-
-To deploy as a standalone pod:
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: kyverno-policy-gc
-  namespace: kyverno-artifact-operator-system
-spec:
-  serviceAccountName: kyverno-artifact-operator-watcher
-  containers:
-  - name: gc
-    image: ghcr.io/octokode/kyverno-artifact-operator:latest
-    args: ["gc"]
-    env:
-    - name: POLL_INTERVAL
-      value: "300"  # 5 minutes
-  restartPolicy: Always
-```
-
-### Prerequisites
-- go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### Running Locally
-
-**Run the operator (automatically installs CRDs):**
-
-```sh
-make run
-```
-
-This will:
-1. Generate manifests
-2. Install CRDs into your cluster
-3. Start the operator locally
-
-**Note:** The operator requires a Kubernetes cluster. Make sure your `kubectl` is configured to point to a cluster.
-
-### To Deploy on the cluster
-
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/kyverno-artifact-operator:tag
-```
-
-The build automatically embeds the git version into the binary. You can also set a custom version:
-
-```sh
-VERSION=v1.0.0 make docker-build IMG=<some-registry>/kyverno-artifact-operator:v1.0.0
-```
-
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
-make install
-```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/kyverno-artifact-operator:tag
-```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/kyverno-artifact-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/kyverno-artifact-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.

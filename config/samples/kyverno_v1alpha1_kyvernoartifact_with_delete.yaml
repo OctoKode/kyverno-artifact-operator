@@ -1,0 +1,14 @@
+apiVersion: kyverno.octokode.io/v1alpha1
+kind: KyvernoArtifact
+metadata:
+  labels:
+    app.kubernetes.io/name: kyverno-artifact-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: kyvernoartifact-sample-with-delete
+  namespace: kyverno-artifact-operator-system
+spec:
+  url: ghcr.io/myoung34/kyverno-test/policies
+  type: oci
+  provider: github
+  pollingInterval: 60
+  deletePoliciesOnTermination: true
