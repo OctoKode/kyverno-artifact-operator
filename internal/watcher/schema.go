@@ -39,20 +39,21 @@ type ManifestMetadata struct {
 }
 
 type Config struct {
-	GithubToken                 string
-	ImageBase                   string
-	Owner                       string
-	Package                     string
-	PackageNormalized           string
-	PollInterval                int
-	GithubAPIOwnerType          string
-	StateDir                    string
-	LastFile                    string
-	Provider                    string
-	Username                    string
-	Password                    string
-	ArtifactName                string // Name of the KyvernoArtifact resource that owns this watcher
-	DeletePoliciesOnTermination bool   // Whether to delete policies on termination
+	GithubToken                   string
+	ImageBase                     string
+	Owner                         string
+	Package                       string
+	PackageNormalized             string
+	PollInterval                  int
+	GithubAPIOwnerType            string
+	StateDir                      string
+	LastFile                      string
+	Provider                      string
+	Username                      string
+	Password                      string
+	ArtifactName                  string // Name of the KyvernoArtifact resource that owns this watcher
+	DeletePoliciesOnTermination   bool   // Whether to delete policies on termination
+	ReconcilePoliciesFromChecksum bool   // Whether to reconcile policies based on checksums
 }
 
 type GitHubPackageVersion struct {
@@ -125,6 +126,7 @@ func loadConfig() *Config {
 	pollInterval := getEnvAsIntOrDefault("POLL_INTERVAL", 30)
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
 	deletePoliciesOnTermination := getEnvAsBoolOrDefault("WATCHER_DELETE_POLICIES_ON_TERMINATION", false)
+	reconcilePoliciesFromChecksum := getEnvAsBoolOrDefault("WATCHER_CHECKSUM_RECONCILIATION_ENABLED", false)
 
 	// Get artifact name from pod name (format: kyverno-artifact-manager-{artifactName})
 	// This is used to link policies back to their source KyvernoArtifact for garbage collection
@@ -147,20 +149,21 @@ func loadConfig() *Config {
 	lastFile := filepath.Join(stateDir, "last_seen")
 
 	return &Config{
-		GithubToken:                 githubToken,
-		ImageBase:                   imageBase,
-		Owner:                       owner,
-		Package:                     packageName,
-		PackageNormalized:           packageNormalized,
-		PollInterval:                pollInterval,
-		GithubAPIOwnerType:          githubAPIOwnerType,
-		StateDir:                    stateDir,
-		LastFile:                    lastFile,
-		Provider:                    provider,
-		Username:                    username,
-		Password:                    password,
-		ArtifactName:                artifactName,
-		DeletePoliciesOnTermination: deletePoliciesOnTermination,
+		GithubToken:                   githubToken,
+		ImageBase:                     imageBase,
+		Owner:                         owner,
+		Package:                       packageName,
+		PackageNormalized:             packageNormalized,
+		PollInterval:                  pollInterval,
+		GithubAPIOwnerType:            githubAPIOwnerType,
+		StateDir:                      stateDir,
+		LastFile:                      lastFile,
+		Provider:                      provider,
+		Username:                      username,
+		Password:                      password,
+		ArtifactName:                  artifactName,
+		DeletePoliciesOnTermination:   deletePoliciesOnTermination,
+		ReconcilePoliciesFromChecksum: reconcilePoliciesFromChecksum,
 	}
 }
 

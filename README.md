@@ -58,6 +58,11 @@ spec:
   # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.
   # +optional
   deletePoliciesOnTermination: true
+  # reconcilePoliciesFromChecksum enables or disables policy reconciliation based on checksums.
+  # When enabled, policies will be updated even if their version tag has not changed, but their content (SHA256 checksum) has.
+  # Defaults to false. Can be overridden by the WATCHER_CHECKSUM_RECONCILIATION_ENABLED environment variable.
+  # +optional
+  reconcilePoliciesFromChecksum: false
 ```
 
 #### For Artifactory:
@@ -76,6 +81,11 @@ spec:
   # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.
   # +optional
   deletePoliciesOnTermination: true
+  # reconcilePoliciesFromChecksum enables or disables policy reconciliation based on checksums.
+  # When enabled, policies will be updated even if their version tag has not changed, but their content (SHA256 checksum) has.
+  # Defaults to false. Can be overridden by the WATCHER_CHECKSUM_RECONCILIATION_ENABLED environment variable.
+  # +optional
+  reconcilePoliciesFromChecksum: false
 ```
 
 ```bash
@@ -124,6 +134,14 @@ kubectl set env deployment/kyverno-artifact-operator-controller-manager \
   WATCHER_SECRET_NAME=my-custom-secret
 ```
 
+**Quick example** - Enable checksum-based policy reconciliation:
+
+```bash
+kubectl set env deployment/kyverno-artifact-operator-controller-manager \
+  -n kyverno-artifact-operator-system \
+  WATCHER_CHECKSUM_RECONCILIATION_ENABLED=true
+```
+
 ## Getting Started
 
 ### Binary Modes
@@ -151,6 +169,8 @@ When running in watcher mode, the binary requires these environment variables:
 - `GITHUB_TOKEN`: GitHub token (for GitHub provider)
 - `ARTIFACTORY_USERNAME` and `ARTIFACTORY_PASSWORD`: Credentials (for Artifactory provider)
 - `POLL_INTERVAL`: Poll interval in seconds (default: 30)
+- `WATCHER_DELETE_POLICIES_ON_TERMINATION`: If set to "true", policies will be deleted on watcher termination (default: false)
+- `WATCHER_CHECKSUM_RECONCILIATION_ENABLED`: If set to "true", enables reconciliation of policies based on content checksums (default: false)
 
 #### Garbage Collector Mode
 

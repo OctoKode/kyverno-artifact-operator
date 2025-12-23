@@ -2,6 +2,8 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,6 +52,12 @@ var (
 	// pullImageToDirFunc can be overridden in tests
 	pullImageToDirFunc = pullImageToDirReal
 )
+
+// calculateSHA256 returns the SHA256 checksum of the given data as a hexadecimal string.
+func calculateSHA256(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
 
 // Run starts the artifact watcher
 func Run(version string) {
@@ -395,14 +403,21 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 		}
 	}
 
-	// Add labels to manifests
+	// Add labels to manifests and calculate checksums
 	files, err := findYAMLFiles(destDir)
 	if err != nil {
 		return err
 	}
 
 	for _, f := range files {
-		if err := addLabelsToManifest(f, tag, config.ArtifactName); err != nil {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			log.Printf("Warning: failed to read file %s for checksum calculation: %v\n", f, err)
+			continue
+		}
+		checksum := calculateSHA256(data)
+
+		if err := addLabelsToManifest(f, tag, config.ArtifactName, checksum); err != nil {
 			log.Printf("Warning: failed to add labels to %s: %v\n", f, err)
 			// Don't fail - continue with other files
 			continue
@@ -484,14 +499,14 @@ func orasPull(config *Config, destDir string) error {
 	return nil
 }
 
-func addLabelsToManifest(filePath, tag, artifactName string) error {
+func addLabelsToManifest(filePath, tag, artifactName, checksum string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("reading file: %w", err)
 	}
 
 	// Add labels to the YAML content
-	updatedData, err := addLabelsToYAML(data, tag, artifactName)
+	updatedData, err := addLabelsToYAML(data, tag, artifactName, checksum)
 	if err != nil {
 		return fmt.Errorf("adding labels: %w", err)
 	}
@@ -504,7 +519,7 @@ func addLabelsToManifest(filePath, tag, artifactName string) error {
 	return nil
 }
 
-func addLabelsToYAML(yamlData []byte, tag, artifactName string) ([]byte, error) {
+func addLabelsToYAML(yamlData []byte, tag, artifactName, checksum string) ([]byte, error) {
 	var manifest Manifest
 	if err := yaml.Unmarshal(yamlData, &manifest); err != nil {
 		return nil, fmt.Errorf("unmarshaling YAML: %w", err)
@@ -521,6 +536,7 @@ func addLabelsToYAML(yamlData []byte, tag, artifactName string) ([]byte, error) 
 	if artifactName != "" {
 		manifest.Metadata.Labels["artifact-name"] = artifactName
 	}
+	manifest.Metadata.Labels["policy-checksum"] = checksum
 
 	// Marshal back to YAML
 	updatedData, err := yaml.Marshal(&manifest)
@@ -662,29 +678,104 @@ func applyManifestsReal(config *Config, dir string) error {
 	}
 
 	for _, f := range files {
-		log.Printf("Applying %s\n", f)
+		log.Printf("Processing %s\n", f)
+
+		// Read the content of the file
+		fileContent, err := os.ReadFile(f)
+		if err != nil {
+			log.Printf("Warning: failed to read file %s: %v\n", f, err)
+			continue
+		}
+
+		// Calculate the checksum of the new manifest
+		newChecksum := calculateSHA256(fileContent)
+
+		// Decode the manifest to get its metadata (name, namespace, kind, labels)
+		var manifest Manifest
+		if err := yaml.Unmarshal(fileContent, &manifest); err != nil {
+			log.Printf("Warning: failed to unmarshal YAML from %s: %v\n", f, err)
+			continue
+		}
 
 		// Create a fresh cached discovery client for each file to ensure we fetch the latest CRDs
-		// This invalidates any cached API resources and queries the API server again
 		cachedClient := memory.NewMemCacheClient(discoveryClient)
-
-		// Refresh API group resources for each file to ensure we have the latest CRDs
 		apiGroupResources, err := restmapper.GetAPIGroupResources(cachedClient)
 		if err != nil {
 			log.Printf("Warning: failed to get API group resources for %s: %v\n", f, err)
 			continue
 		}
-
-		// Create a fresh REST mapper for each file to pick up newly installed CRDs
 		mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
 
-		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
-			log.Printf("Failed to apply %s: %v\n", f, err)
-			// Continue with other files even if one fails
+		// Get GVR from the object using the REST mapper
+		gvk := schema.GroupVersionKind{
+			Group:   strings.Split(manifest.APIVersion, "/")[0],
+			Version: strings.Split(manifest.APIVersion, "/")[1],
+			Kind:    manifest.Kind,
+		}
+		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			log.Printf("Warning: failed to get REST mapping for %s: %v\n", gvk.String(), err)
+			// Continue with other files even if one fails to map
 			continue
 		}
+		gvr := mapping.Resource
 
-		log.Printf("Successfully applied %s\n", f)
+		// Attempt to get the existing resource from the cluster
+		var existingPolicy *unstructured.Unstructured
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			existingPolicy, err = dynamicClient.Resource(gvr).Namespace(manifest.Metadata.Namespace).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+		} else {
+			existingPolicy, err = dynamicClient.Resource(gvr).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+		}
+
+		if err != nil && !strings.Contains(err.Error(), "not found") { // Ignore "not found" errors
+			log.Printf("Warning: failed to get existing policy %s/%s (%s) from cluster: %v\n",
+				manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, err)
+			// Continue with applying, it might be a new resource
+		}
+
+		shouldUpdate := true // Default to update if new or if there are issues getting existing
+		if existingPolicy != nil {
+			if config.ReconcilePoliciesFromChecksum {
+				existingChecksum := existingPolicy.GetLabels()["policy-checksum"]
+				existingPolicyVersion := existingPolicy.GetLabels()["policy-version"]
+
+				if newChecksum == existingChecksum && manifest.Metadata.Labels["policy-version"] == existingPolicyVersion {
+					log.Printf("Policy %s/%s (%s) unchanged (checksum: %s, version: %s), skipping update.\n",
+						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, newChecksum, manifest.Metadata.Labels["policy-version"])
+					shouldUpdate = false
+				} else if newChecksum != existingChecksum {
+					log.Printf("Policy %s/%s (%s) content changed (old checksum: %s, new checksum: %s). Updating policy.\n",
+						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingChecksum, newChecksum)
+				} else if manifest.Metadata.Labels["policy-version"] != existingPolicyVersion {
+					log.Printf("Policy %s/%s (%s) version changed (old version: %s, new version: %s). Updating policy.\n",
+						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion, manifest.Metadata.Labels["policy-version"])
+				}
+			} else {
+				// If checksum reconciliation is disabled, only update if policy-version changes
+				existingPolicyVersion := existingPolicy.GetLabels()["policy-version"]
+				if manifest.Metadata.Labels["policy-version"] == existingPolicyVersion {
+					log.Printf("Policy %s/%s (%s) unchanged (version: %s), skipping update. Checksum reconciliation is disabled.\n",
+						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion)
+					shouldUpdate = false
+				} else {
+					log.Printf("Policy %s/%s (%s) version changed (old version: %s, new version: %s). Updating policy.\n",
+						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion, manifest.Metadata.Labels["policy-version"])
+				}
+			}
+		} else {
+			log.Printf("Policy %s/%s (%s) not found on cluster. Creating new policy.\n",
+				manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind)
+		}
+
+		if shouldUpdate {
+			if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
+				log.Printf("Failed to apply %s: %v\n", f, err)
+				// Continue with other files even if one fails
+				continue
+			}
+			log.Printf("Successfully applied %s\n", f)
+		}
 	}
 
 	return nil

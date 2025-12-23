@@ -117,6 +117,13 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			})
 		}
 
+		if kyvernoArtifact.Spec.ReconcilePoliciesFromChecksum != nil {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "WATCHER_CHECKSUM_RECONCILIATION_ENABLED",
+				Value: fmt.Sprintf("%t", *kyvernoArtifact.Spec.ReconcilePoliciesFromChecksum),
+			})
+		}
+
 		// Add provider-specific credentials
 		switch provider {
 		case providerGitHub:

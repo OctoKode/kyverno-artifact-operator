@@ -11,3 +11,4 @@ spec:
   type: oci
   provider: artifactory
   pollingInterval: 60
+  reconcilePoliciesFromChecksum: false

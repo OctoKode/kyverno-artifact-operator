@@ -43,6 +43,9 @@ type KyvernoArtifactSpec struct {
 	PollingInterval *int32 `json:"pollingInterval,omitempty"`
 	// +optional
 	DeletePoliciesOnTermination *bool `json:"deletePoliciesOnTermination,omitempty"`
+	// reconcilePoliciesFromChecksum enables or disables policy reconciliation based on checksums.
+	// +optional
+	ReconcilePoliciesFromChecksum *bool `json:"reconcilePoliciesFromChecksum,omitempty"`
 }
 
 // KyvernoArtifactStatus defines the observed state of KyvernoArtifact.

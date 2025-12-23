@@ -50,6 +50,10 @@ spec:
                 description: provider is the artifact provider such as 'github' or
                   'artifactory'. Both github and artifactory are supported.
                 type: string
+              reconcilePoliciesFromChecksum:
+                description: reconcilePoliciesFromChecksum enables or disables policy
+                  reconciliation based on checksums.
+                type: boolean
               type:
                 description: type is the type of artifact such as 'oci-image' or 'git-repo'.
                   Only oci-image is supported for now.

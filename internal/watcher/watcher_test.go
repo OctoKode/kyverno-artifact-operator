@@ -924,7 +924,7 @@ metadata:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := addLabelsToYAML([]byte(tt.inputYAML), tt.tag, tt.artifactName)
+			result, err := addLabelsToYAML([]byte(tt.inputYAML), tt.tag, tt.artifactName, "dummy-checksum")
 			if err != nil {
 				t.Fatalf("addLabelsToYAML() error = %v", err)
 			}

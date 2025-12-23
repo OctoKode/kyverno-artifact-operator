@@ -12,3 +12,4 @@ spec:
   provider: github
   pollingInterval: 60
   deletePoliciesOnTermination: true
+  reconcilePoliciesFromChecksum: false
