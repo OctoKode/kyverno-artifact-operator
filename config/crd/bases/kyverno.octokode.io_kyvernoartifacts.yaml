@@ -39,6 +39,8 @@ spec:
           spec:
             description: spec defines the desired state of KyvernoArtifact
             properties:
+              deletePoliciesOnTermination:
+                type: boolean
               pollingInterval:
                 description: pollingInterval is the interval in seconds to check for
                   updates to the artifact.

@@ -644,3 +644,112 @@ func TestReconcileKyvernoArtifact_MetricsUpdate(t *testing.T) {
 		t.Error("ArtifactsByPhase metric should be initialized")
 	}
 }
+
+func TestReconcileKyvernoArtifact_DeletePoliciesOnTermination(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = kyvernov1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name                        string
+		deletePoliciesOnTermination *bool
+		expectEnvVar                bool
+	}{
+		{
+			name:                        "deletePoliciesOnTermination is true",
+			deletePoliciesOnTermination: ptrBool(true),
+			expectEnvVar:                true,
+		},
+		{
+			name:                        "deletePoliciesOnTermination is false",
+			deletePoliciesOnTermination: ptrBool(false),
+			expectEnvVar:                false,
+		},
+		{
+			name:                        "deletePoliciesOnTermination is nil",
+			deletePoliciesOnTermination: nil,
+			expectEnvVar:                false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			artifact := &kyvernov1alpha1.KyvernoArtifact{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-artifact",
+					Namespace: "default",
+					UID:       "test-uid-123",
+				},
+				Spec: kyvernov1alpha1.KyvernoArtifactSpec{
+					ArtifactUrl:                 ptrString("ghcr.io/owner/package:v1.0.0"),
+					ArtifactProvider:            ptrString("github"),
+					DeletePoliciesOnTermination: tt.deletePoliciesOnTermination,
+				},
+			}
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kyverno-watcher-secret",
+					Namespace: "default",
+				},
+				Data: map[string][]byte{
+					"github-token": []byte("test-token"),
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(artifact, secret).
+				Build()
+
+			reconciler := &KyvernoArtifactReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+				Config: DefaultConfig(),
+			}
+
+			req := ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-artifact",
+					Namespace: "default",
+				},
+			}
+
+			_, err := reconciler.Reconcile(context.Background(), req)
+			if err != nil {
+				t.Errorf("Reconcile() error = %v, want nil", err)
+			}
+
+			// Verify pod has correct WATCHER_DELETE_POLICIES_ON_TERMINATION env var
+			var pods corev1.PodList
+			err = fakeClient.List(context.Background(), &pods, client.InNamespace("default"))
+			if err != nil {
+				t.Fatalf("Failed to list pods: %v", err)
+			}
+
+			if len(pods.Items) != 1 {
+				t.Fatalf("Expected 1 pod, got %d", len(pods.Items))
+			}
+
+			container := pods.Items[0].Spec.Containers[0]
+			foundEnvVar := false
+			for _, env := range container.Env {
+				if env.Name == "WATCHER_DELETE_POLICIES_ON_TERMINATION" {
+					foundEnvVar = true
+					if env.Value != "true" {
+						t.Errorf("WATCHER_DELETE_POLICIES_ON_TERMINATION should be 'true', got '%s'", env.Value)
+					}
+					break
+				}
+			}
+
+			if foundEnvVar != tt.expectEnvVar {
+				t.Errorf("Expected WATCHER_DELETE_POLICIES_ON_TERMINATION env var to be %v, but it was %v", tt.expectEnvVar, foundEnvVar)
+			}
+		})
+	}
+}
+
+func ptrBool(b bool) *bool {
+	return &b
+}

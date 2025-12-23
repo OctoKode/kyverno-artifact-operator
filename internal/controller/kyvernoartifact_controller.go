@@ -148,6 +148,13 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			},
 		}
 
+		if kyvernoArtifact.Spec.DeletePoliciesOnTermination != nil && *kyvernoArtifact.Spec.DeletePoliciesOnTermination {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "WATCHER_DELETE_POLICIES_ON_TERMINATION",
+				Value: "true",
+			})
+		}
+
 		// Add provider-specific credentials
 		switch provider {
 		case providerGitHub:

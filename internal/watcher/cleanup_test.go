@@ -9,6 +9,93 @@ import (
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 )
 
+func TestGetEnvAsBoolOrDefault(t *testing.T) {
+	tests := []struct {
+		name         string
+		key          string
+		defaultValue bool
+		envValue     string
+		setEnv       bool
+		want         bool
+	}{
+		{
+			name:         "true values",
+			key:          "TEST_BOOL_1",
+			defaultValue: false,
+			envValue:     "true",
+			setEnv:       true,
+			want:         true,
+		},
+		{
+			name:         "T value",
+			key:          "TEST_BOOL_2",
+			defaultValue: false,
+			envValue:     "T",
+			setEnv:       true,
+			want:         true,
+		},
+		{
+			name:         "1 value",
+			key:          "TEST_BOOL_3",
+			defaultValue: false,
+			envValue:     "1",
+			setEnv:       true,
+			want:         true,
+		},
+		{
+			name:         "false value",
+			key:          "TEST_BOOL_4",
+			defaultValue: true,
+			envValue:     "false",
+			setEnv:       true,
+			want:         false,
+		},
+		{
+			name:         "default value",
+			key:          "TEST_BOOL_5",
+			defaultValue: true,
+			envValue:     "",
+			setEnv:       false,
+			want:         true,
+		},
+		{
+			name:         "random string",
+			key:          "TEST_BOOL_6",
+			defaultValue: true,
+			envValue:     "random",
+			setEnv:       true,
+			want:         false,
+		},
+	}
+
+	originalGetEnvFunc := getEnvFunc
+	defer func() {
+		getEnvFunc = originalGetEnvFunc
+	}()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.setEnv {
+				getEnvFunc = func(key string) string {
+					if key == tt.key {
+						return tt.envValue
+					}
+					return ""
+				}
+			} else {
+				getEnvFunc = func(key string) string {
+					return ""
+				}
+			}
+
+			got := getEnvAsBoolOrDefault(tt.key, tt.defaultValue)
+			if got != tt.want {
+				t.Errorf("getEnvAsBoolOrDefault() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCleanupPolicies(t *testing.T) {
 	artifactName := "my-artifact"
 
@@ -24,9 +111,9 @@ func TestCleanupPolicies(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		existing  []runtime.Object
-		expectErr bool
+		name            string
+		existing        []runtime.Object
+		expectedDeletes int
 	}{
 		{
 			name: "cleanup matching policies",
@@ -70,12 +157,12 @@ func TestCleanupPolicies(t *testing.T) {
 					},
 				},
 			},
-			expectErr: false,
+			expectedDeletes: 2,
 		},
 		{
-			name:      "no matching policies",
-			existing:  []runtime.Object{},
-			expectErr: false,
+			name:            "no matching policies",
+			existing:        []runtime.Object{},
+			expectedDeletes: 0,
 		},
 	}
 
@@ -104,16 +191,8 @@ func TestCleanupPolicies(t *testing.T) {
 				}
 			}
 
-			if tt.name == "cleanup matching policies" {
-				if deleteActions != 2 {
-					t.Errorf("expected 2 delete actions, got %d", deleteActions)
-				}
-			}
-
-			if tt.name == "no matching policies" {
-				if deleteActions != 0 {
-					t.Errorf("expected 0 delete actions, got %d", deleteActions)
-				}
+			if deleteActions != tt.expectedDeletes {
+				t.Errorf("expected %d delete actions, got %d", tt.expectedDeletes, deleteActions)
 			}
 		})
 	}

@@ -73,19 +73,20 @@ type ManifestMetadata struct {
 }
 
 type Config struct {
-	GithubToken        string
-	ImageBase          string
-	Owner              string
-	Package            string
-	PackageNormalized  string
-	PollInterval       int
-	GithubAPIOwnerType string
-	StateDir           string
-	LastFile           string
-	Provider           string
-	Username           string
-	Password           string
-	ArtifactName       string // Name of the KyvernoArtifact resource that owns this watcher
+	GithubToken                 string
+	ImageBase                   string
+	Owner                       string
+	Package                     string
+	PackageNormalized           string
+	PollInterval                int
+	GithubAPIOwnerType          string
+	StateDir                    string
+	LastFile                    string
+	Provider                    string
+	Username                    string
+	Password                    string
+	ArtifactName                string // Name of the KyvernoArtifact resource that owns this watcher
+	DeletePoliciesOnTermination bool   // Whether to delete policies on termination
 }
 
 type GitHubPackageVersion struct {
@@ -106,23 +107,25 @@ func Run(version string) {
 
 	config := loadConfig()
 
-	// Set up signal handling for graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	go func() {
-		<-c
-		log.Println("Received termination signal, cleaning up policies...")
-		kubeConfig, err := k8s.GetConfig()
-		if err != nil {
-			log.Fatalf("Error getting Kubernetes config for cleanup: %v", err)
-		}
-		dynamicClient, err := dynamic.NewForConfig(kubeConfig)
-		if err != nil {
-			log.Fatalf("Error creating dynamic client for cleanup: %v", err)
-		}
-		cleanupPolicies(config, dynamicClient)
-		os.Exit(0)
-	}()
+	if config.DeletePoliciesOnTermination {
+		// Set up signal handling for graceful shutdown
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+		go func() {
+			<-c
+			log.Println("Received termination signal, cleaning up policies...")
+			kubeConfig, err := k8s.GetConfig()
+			if err != nil {
+				log.Fatalf("Error getting Kubernetes config for cleanup: %v", err)
+			}
+			dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+			if err != nil {
+				log.Fatalf("Error creating dynamic client for cleanup: %v", err)
+			}
+			cleanupPolicies(config, dynamicClient)
+			os.Exit(0)
+		}()
+	}
 
 	if config.Provider == ProviderGitHub {
 		log.Printf("Starting GHCR watcher for %s (owner=%s, package=%s)\n",
@@ -268,6 +271,7 @@ func loadConfig() *Config {
 
 	pollInterval := getEnvAsIntOrDefault("POLL_INTERVAL", 30)
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
+	deletePoliciesOnTermination := getEnvAsBoolOrDefault("WATCHER_DELETE_POLICIES_ON_TERMINATION", false)
 
 	// Get artifact name from pod name (format: kyverno-artifact-manager-{artifactName})
 	// This is used to link policies back to their source KyvernoArtifact for garbage collection
@@ -290,20 +294,33 @@ func loadConfig() *Config {
 	lastFile := filepath.Join(stateDir, "last_seen")
 
 	return &Config{
-		GithubToken:        githubToken,
-		ImageBase:          imageBase,
-		Owner:              owner,
-		Package:            packageName,
-		PackageNormalized:  packageNormalized,
-		PollInterval:       pollInterval,
-		GithubAPIOwnerType: githubAPIOwnerType,
-		StateDir:           stateDir,
-		LastFile:           lastFile,
-		Provider:           provider,
-		Username:           username,
-		Password:           password,
-		ArtifactName:       artifactName,
+		GithubToken:                 githubToken,
+		ImageBase:                   imageBase,
+		Owner:                       owner,
+		Package:                     packageName,
+		PackageNormalized:           packageNormalized,
+		PollInterval:                pollInterval,
+		GithubAPIOwnerType:          githubAPIOwnerType,
+		StateDir:                    stateDir,
+		LastFile:                    lastFile,
+		Provider:                    provider,
+		Username:                    username,
+		Password:                    password,
+		ArtifactName:                artifactName,
+		DeletePoliciesOnTermination: deletePoliciesOnTermination,
 	}
+}
+
+func getEnvAsBoolOrDefault(key string, defaultValue bool) bool {
+	if value := getEnvFunc(key); value != "" {
+		switch strings.ToLower(value) {
+		case "t", "true", "1":
+			return true
+		default:
+			return false
+		}
+	}
+	return defaultValue
 }
 
 func parseImageBase(imageBase string) (owner, packageName string, err error) {
@@ -754,7 +771,6 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 	log.Printf("Layer %d media type: %s\n", layerIndex, mediaType)
 
 	// Get layer content
-
 	blob, err := layer.Compressed()
 	if err != nil {
 		return fmt.Errorf("getting compressed layer: %w", err)

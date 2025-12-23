@@ -41,6 +41,8 @@ type KyvernoArtifactSpec struct {
 	// pollingInterval is the interval in seconds to check for updates to the artifact.
 	// +optional
 	PollingInterval *int32 `json:"pollingInterval,omitempty"`
+	// +optional
+	DeletePoliciesOnTermination *bool `json:"deletePoliciesOnTermination,omitempty"`
 }
 
 // KyvernoArtifactStatus defines the observed state of KyvernoArtifact.
