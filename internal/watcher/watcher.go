@@ -536,7 +536,7 @@ func addLabelsToYAML(yamlData []byte, tag, artifactName, checksum string) ([]byt
 	if artifactName != "" {
 		manifest.Metadata.Labels["artifact-name"] = artifactName
 	}
-	manifest.Metadata.Labels["policy-checksum"] = checksum
+	manifest.Metadata.Labels["policy-checksum"] = checksum[:12]
 
 	// Marshal back to YAML
 	updatedData, err := yaml.Marshal(&manifest)
@@ -688,7 +688,7 @@ func applyManifestsReal(config *Config, dir string) error {
 		}
 
 		// Calculate the checksum of the new manifest
-		newChecksum := calculateSHA256(fileContent)
+		newChecksum := calculateSHA256(fileContent)[:12]
 
 		// Decode the manifest to get its metadata (name, namespace, kind, labels)
 		var manifest Manifest
