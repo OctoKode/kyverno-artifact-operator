@@ -26,10 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/restmapper"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	orasremote "oras.land/oras-go/v2/registry/remote"
@@ -51,6 +48,12 @@ var (
 	applyManifestsFunc = applyManifestsReal
 	// pullImageToDirFunc can be overridden in tests
 	pullImageToDirFunc = pullImageToDirReal
+	// tagChangedFunc can be overridden in tests
+	tagChangedFunc = tagChanged
+	// getKubernetesClientsFunc can be overridden in tests
+	getKubernetesClientsFunc = getKubernetesClients
+	// checksumsChangedFunc can be overridden in tests
+	checksumsChangedFunc = checksumsChanged
 )
 
 // calculateSHA256 returns the SHA256 checksum of the given data as a hexadecimal string.
@@ -66,8 +69,10 @@ func Run(version string) {
 	log.Printf("Kyverno Artifact Watcher version %s\n", Version)
 
 	config := loadConfig()
+	log.Printf("Using configuration %+v\n", config)
 
 	if config.DeletePoliciesOnTermination {
+		log.Printf("Deleting policies on termination is enabled.")
 		// Set up signal handling for graceful shutdown
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
@@ -170,59 +175,71 @@ func deleteResourcesByLabel(dynamicClient dynamic.Interface, gvr schema.GroupVer
 }
 
 func watchLoop(config *Config) error {
-	var latest string
-	var err error
-
-	if config.Provider == ProviderGitHub {
-		latest, err = getLatestTagOrDigest(config)
-		if err != nil {
-			return fmt.Errorf("could not determine latest tag/digest: %w", err)
-		}
-
-		if latest == "" {
-			log.Println("No versions found for package")
-			return nil
-		}
-	} else {
-		// For artifactory, check if a specific tag is provided or look for latest
-		parts := strings.Split(config.ImageBase, ":")
-		if len(parts) >= 2 && parts[len(parts)-1] != "latest" {
-			// User specified a specific tag/version, use it as-is
-			latest = parts[len(parts)-1]
-		} else {
-			// No specific version or "latest" tag - query Artifactory for latest version
-			latest, err = getLatestArtifactoryTag(config)
-			if err != nil {
-				return fmt.Errorf("could not determine latest Artifactory tag: %w", err)
-			}
-			if latest == "" {
-				log.Println("No versions found in Artifactory")
-				return nil
-			}
-		}
+	isTagChanged, latest, prevTag, err := tagChangedFunc(config)
+	if err != nil {
+		return fmt.Errorf("error checking for tag change: %w", err)
 	}
 
-	prev, _ := os.ReadFile(config.LastFile)
-	prevTag := strings.TrimSpace(string(prev))
+	// Exit early if nothing has changed and checksum reconciliation is disabled
+	if !isTagChanged && !config.ReconcilePoliciesFromChecksum {
+		log.Printf("No change (latest=%s)\n", latest)
+		return nil
+	}
 
-	if latest != prevTag {
-		log.Printf("Detected change: previous='%s' new='%s'\n", prevTag, latest)
+	appliedSomething := false
 
+	dynamicClient, mapper, err := getKubernetesClientsFunc()
+	if err != nil {
+		return fmt.Errorf("failed to get Kubernetes clients: %w", err)
+	}
+
+	if isTagChanged {
+		log.Printf("Detected new tag: previous='%s' new='%s'. Applying all manifests.\n", prevTag, latest)
 		destDir := fmt.Sprintf("/tmp/image-%s", sanitizePath(latest))
 
-		if err := pullImageToDirFunc(config, latest, destDir); err != nil {
+		newChecksums, err := pullImageToDirFunc(config, latest, destDir)
+		if err != nil {
 			return fmt.Errorf("pull failed: %w", err)
 		}
 
-		if err := applyManifestsFunc(config, destDir); err != nil {
-			return fmt.Errorf("apply manifests failed: %w", err)
+		var allFiles []string
+		for filePath := range newChecksums {
+			allFiles = append(allFiles, filePath)
 		}
 
+		if err := applyManifestsFunc(config, allFiles, mapper, dynamicClient); err != nil {
+			return fmt.Errorf("apply manifests failed: %w", err)
+		}
+		appliedSomething = true
+
+	} else if config.ReconcilePoliciesFromChecksum {
+		log.Printf("No tag change, but checksum reconciliation is enabled. Checking manifests.\n")
+		destDir := fmt.Sprintf("/tmp/image-%s", sanitizePath(latest))
+
+		newChecksums, err := pullImageToDirFunc(config, latest, destDir)
+		if err != nil {
+			return fmt.Errorf("pull failed: %w", err)
+		}
+
+		changed, filesToApply, err := checksumsChangedFunc(newChecksums, dynamicClient, mapper)
+		if err != nil {
+			log.Printf("Error during checksum comparison: %v", err)
+		}
+
+		if changed {
+			if err := applyManifestsFunc(config, filesToApply, mapper, dynamicClient); err != nil {
+				return fmt.Errorf("apply manifests failed: %w", err)
+			}
+			appliedSomething = true
+		} else {
+			log.Println("All policies are up to date, no manifests to apply.")
+		}
+	}
+
+	if appliedSomething {
 		if err := os.WriteFile(config.LastFile, []byte(latest), 0644); err != nil {
 			return fmt.Errorf("failed to write last file: %w", err)
 		}
-	} else {
-		log.Printf("No change (latest=%s)\n", latest)
 	}
 
 	return nil
@@ -366,16 +383,16 @@ func getLatestArtifactoryTag(config *Config) (string, error) {
 }
 
 //nolint:unused // Used via pullImageToDirFunc for testing
-func pullImageToDir(config *Config, tag, destDir string) error {
+func pullImageToDir(config *Config, tag, destDir string) (map[string]string, error) {
 	return pullImageToDirFunc(config, tag, destDir)
 }
 
-func pullImageToDirReal(config *Config, tag, destDir string) error {
+func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string, error) {
 	if err := os.RemoveAll(destDir); err != nil {
 		log.Printf("Warning: failed to remove directory %s: %v", destDir, err)
 	}
 	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return err
+		return nil, err
 	}
 
 	if config.Provider == ProviderArtifactory {
@@ -389,7 +406,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 		configWithTag.ImageBase = imageRef
 
 		if err := pullWithOras(&configWithTag, destDir); err != nil {
-			return fmt.Errorf("oras pull failed: %w", err)
+			return nil, fmt.Errorf("oras pull failed: %w", err)
 		}
 	} else {
 		log.Printf("Pulling image %s:%s into %s ...\n", config.ImageBase, tag, destDir)
@@ -399,16 +416,17 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 		ctx := context.Background()
 
 		if err := pullOCI(ctx, imageRef, destDir); err != nil {
-			return fmt.Errorf("OCI pull failed: %w", err)
+			return nil, fmt.Errorf("OCI pull failed: %w", err)
 		}
 	}
 
 	// Add labels to manifests and calculate checksums
 	files, err := findYAMLFiles(destDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	manifestChecksums := make(map[string]string)
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -416,6 +434,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 			continue
 		}
 		checksum := calculateSHA256(data)
+		manifestChecksums[f] = checksum[:48]
 
 		if err := addLabelsToManifest(f, tag, config.ArtifactName, checksum); err != nil {
 			log.Printf("Warning: failed to add labels to %s: %v\n", f, err)
@@ -424,7 +443,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) error {
 		}
 	}
 
-	return nil
+	return manifestChecksums, nil
 }
 
 func pullWithOras(config *Config, destDir string) error {
@@ -536,7 +555,7 @@ func addLabelsToYAML(yamlData []byte, tag, artifactName, checksum string) ([]byt
 	if artifactName != "" {
 		manifest.Metadata.Labels["artifact-name"] = artifactName
 	}
-	manifest.Metadata.Labels["policy-checksum"] = checksum[:12]
+	manifest.Metadata.Labels["policy-checksum"] = checksum[:48]
 
 	// Marshal back to YAML
 	updatedData, err := yaml.Marshal(&manifest)
@@ -642,140 +661,26 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 }
 
 //nolint:unused // Used via applyManifestsFunc for testing
-func applyManifests(config *Config, dir string) error {
-	return applyManifestsFunc(config, dir)
+func applyManifests(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
+	return applyManifestsFunc(config, files, mapper, dynamicClient)
 }
 
-func applyManifestsReal(config *Config, dir string) error {
-	// Find YAML files
-	files, err := findYAMLFiles(dir)
-	if err != nil {
-		return err
-	}
-
+func applyManifestsReal(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
 	if len(files) == 0 {
-		log.Printf("No YAML manifests found in %s\n", dir)
+		log.Printf("No YAML manifests found to apply\n")
 		return nil
 	}
 
-	log.Printf("Applying manifests in %s ...\n", dir)
-
-	// Get Kubernetes client
-	kubeConfig, err := k8s.GetConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
-	}
-
-	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create dynamic client: %w", err)
-	}
-
-	// Create discovery client to get REST mapper for proper GVK to GVR conversion
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(kubeConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create discovery client: %w", err)
-	}
+	log.Printf("Applying %d manifests ...\n", len(files))
 
 	for _, f := range files {
-		log.Printf("Processing %s\n", f)
-
-		// Read the content of the file
-		fileContent, err := os.ReadFile(f)
-		if err != nil {
-			log.Printf("Warning: failed to read file %s: %v\n", f, err)
+		log.Printf("Applying %s\n", f)
+		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
+			log.Printf("Failed to apply %s: %v\n", f, err)
+			// Continue with other files even if one fails
 			continue
 		}
-
-		// Calculate the checksum of the new manifest
-		newChecksum := calculateSHA256(fileContent)[:12]
-
-		// Decode the manifest to get its metadata (name, namespace, kind, labels)
-		var manifest Manifest
-		if err := yaml.Unmarshal(fileContent, &manifest); err != nil {
-			log.Printf("Warning: failed to unmarshal YAML from %s: %v\n", f, err)
-			continue
-		}
-
-		// Create a fresh cached discovery client for each file to ensure we fetch the latest CRDs
-		cachedClient := memory.NewMemCacheClient(discoveryClient)
-		apiGroupResources, err := restmapper.GetAPIGroupResources(cachedClient)
-		if err != nil {
-			log.Printf("Warning: failed to get API group resources for %s: %v\n", f, err)
-			continue
-		}
-		mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
-
-		// Get GVR from the object using the REST mapper
-		gvk := schema.GroupVersionKind{
-			Group:   strings.Split(manifest.APIVersion, "/")[0],
-			Version: strings.Split(manifest.APIVersion, "/")[1],
-			Kind:    manifest.Kind,
-		}
-		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-		if err != nil {
-			log.Printf("Warning: failed to get REST mapping for %s: %v\n", gvk.String(), err)
-			// Continue with other files even if one fails to map
-			continue
-		}
-		gvr := mapping.Resource
-
-		// Attempt to get the existing resource from the cluster
-		var existingPolicy *unstructured.Unstructured
-		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			existingPolicy, err = dynamicClient.Resource(gvr).Namespace(manifest.Metadata.Namespace).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
-		} else {
-			existingPolicy, err = dynamicClient.Resource(gvr).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
-		}
-
-		if err != nil && !strings.Contains(err.Error(), "not found") { // Ignore "not found" errors
-			log.Printf("Warning: failed to get existing policy %s/%s (%s) from cluster: %v\n",
-				manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, err)
-			// Continue with applying, it might be a new resource
-		}
-
-		shouldUpdate := true // Default to update if new or if there are issues getting existing
-		if existingPolicy != nil {
-			if config.ReconcilePoliciesFromChecksum {
-				existingChecksum := existingPolicy.GetLabels()["policy-checksum"]
-				existingPolicyVersion := existingPolicy.GetLabels()["policy-version"]
-
-				if newChecksum == existingChecksum && manifest.Metadata.Labels["policy-version"] == existingPolicyVersion {
-					log.Printf("Policy %s/%s (%s) unchanged (checksum: %s, version: %s), skipping update.\n",
-						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, newChecksum, manifest.Metadata.Labels["policy-version"])
-					shouldUpdate = false
-				} else if newChecksum != existingChecksum {
-					log.Printf("Policy %s/%s (%s) content changed (old checksum: %s, new checksum: %s). Updating policy.\n",
-						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingChecksum, newChecksum)
-				} else if manifest.Metadata.Labels["policy-version"] != existingPolicyVersion {
-					log.Printf("Policy %s/%s (%s) version changed (old version: %s, new version: %s). Updating policy.\n",
-						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion, manifest.Metadata.Labels["policy-version"])
-				}
-			} else {
-				// If checksum reconciliation is disabled, only update if policy-version changes
-				existingPolicyVersion := existingPolicy.GetLabels()["policy-version"]
-				if manifest.Metadata.Labels["policy-version"] == existingPolicyVersion {
-					log.Printf("Policy %s/%s (%s) unchanged (version: %s), skipping update. Checksum reconciliation is disabled.\n",
-						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion)
-					shouldUpdate = false
-				} else {
-					log.Printf("Policy %s/%s (%s) version changed (old version: %s, new version: %s). Updating policy.\n",
-						manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind, existingPolicyVersion, manifest.Metadata.Labels["policy-version"])
-				}
-			}
-		} else {
-			log.Printf("Policy %s/%s (%s) not found on cluster. Creating new policy.\n",
-				manifest.Metadata.Namespace, manifest.Metadata.Name, manifest.Kind)
-		}
-
-		if shouldUpdate {
-			if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
-				log.Printf("Failed to apply %s: %v\n", f, err)
-				// Continue with other files even if one fails
-				continue
-			}
-			log.Printf("Successfully applied %s\n", f)
-		}
+		log.Printf("Successfully applied %s\n", f)
 	}
 
 	return nil

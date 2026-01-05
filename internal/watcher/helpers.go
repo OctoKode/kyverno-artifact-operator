@@ -1,0 +1,146 @@
+package watcher
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/restmapper"
+	"sigs.k8s.io/yaml"
+)
+
+// checksumsChanged compares the checksums of freshly pulled manifests against
+// the versions in the cluster. It returns true if any manifest is new or has changed,
+// along with a list of files that need to be applied.
+func checksumsChanged(newChecksums map[string]string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) (bool, []string, error) {
+	var filesToApply []string
+	changed := false
+
+	for file, newChecksum := range newChecksums {
+		fileContent, err := os.ReadFile(file)
+		if err != nil {
+			log.Printf("Warning: failed to read file %s for checksum comparison: %v\n", file, err)
+			continue
+		}
+		var manifest Manifest
+		if err := yaml.Unmarshal(fileContent, &manifest); err != nil {
+			log.Printf("Warning: failed to unmarshal YAML from %s: %v\n", file, err)
+			continue
+		}
+
+		gvk := schema.GroupVersionKind{
+			Group:   strings.Split(manifest.APIVersion, "/")[0],
+			Version: strings.Split(manifest.APIVersion, "/")[1],
+			Kind:    manifest.Kind,
+		}
+		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			log.Printf("Warning: failed to get REST mapping for %s: %v\n", gvk.String(), err)
+			continue
+		}
+
+		var existingPolicy *unstructured.Unstructured
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Namespace(manifest.Metadata.Namespace).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+		} else {
+			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+		}
+
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				log.Printf("Policy %s/%s not found. Adding to apply list.\n", manifest.Metadata.Namespace, manifest.Metadata.Name)
+				filesToApply = append(filesToApply, file)
+				changed = true
+			} else {
+				log.Printf("Warning: failed to get existing policy %s/%s: %v\n", manifest.Metadata.Namespace, manifest.Metadata.Name, err)
+			}
+			continue
+		}
+
+		existingChecksum := existingPolicy.GetLabels()["policy-checksum"]
+		if newChecksum != existingChecksum {
+			log.Printf("Policy %s/%s content changed (old checksum: %s, new checksum: %s). Adding to apply list.\n", manifest.Metadata.Namespace, manifest.Metadata.Name, existingChecksum, newChecksum)
+			filesToApply = append(filesToApply, file)
+			changed = true
+		} else {
+			log.Printf("Policy %s/%s unchanged (checksum: %s). Skipping.\n", manifest.Metadata.Namespace, manifest.Metadata.Name, newChecksum)
+		}
+	}
+
+	return changed, filesToApply, nil
+}
+
+// tagChanged checks if the artifact tag has changed since the last check.
+// It returns true if the tag is new, the latest tag, the previous tag, and any error.
+func tagChanged(config *Config) (bool, string, string, error) {
+	var latest string
+	var err error
+
+	if config.Provider == ProviderGitHub {
+		latest, err = getLatestTagOrDigest(config)
+		if err != nil {
+			return false, "", "", fmt.Errorf("could not determine latest tag/digest: %w", err)
+		}
+
+		if latest == "" {
+			log.Println("No versions found for package")
+			return false, "", "", nil
+		}
+	} else {
+		// For artifactory, check if a specific tag is provided or look for latest
+		parts := strings.Split(config.ImageBase, ":")
+		if len(parts) >= 2 && parts[len(parts)-1] != "latest" {
+			// User specified a specific tag/version, use it as-is
+			latest = parts[len(parts)-1]
+		} else {
+			// No specific version or "latest" tag - query Artifactory for latest version
+			latest, err = getLatestArtifactoryTag(config)
+			if err != nil {
+				return false, "", "", fmt.Errorf("could not determine latest Artifactory tag: %w", err)
+			}
+			if latest == "" {
+				log.Println("No versions found in Artifactory")
+				return false, "", "", nil
+			}
+		}
+	}
+
+	prev, _ := os.ReadFile(config.LastFile)
+	prevTag := strings.TrimSpace(string(prev))
+
+	return latest != prevTag, latest, prevTag, nil
+}
+
+// getKubernetesClients initializes and returns the dynamic Kubernetes client and REST mapper.
+func getKubernetesClients() (dynamic.Interface, meta.RESTMapper, error) {
+	kubeConfig, err := k8s.GetConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(kubeConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	cachedClient := memory.NewMemCacheClient(discoveryClient)
+	apiGroupResources, err := restmapper.GetAPIGroupResources(cachedClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get API group resources: %w", err)
+	}
+	mapper := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
+
+	return dynamicClient, mapper, nil
+}

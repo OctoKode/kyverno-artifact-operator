@@ -10,6 +10,8 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/yaml"
 )
 
@@ -497,37 +499,51 @@ func TestWatchLoopProviderBehavior(t *testing.T) {
 			// Use temp directory for test state
 			testTempDir := t.TempDir()
 
-			// Mock pullImageToDir to avoid creating /tmp/image-* directories
+			// Mock functions
+			originalTagChanged := tagChangedFunc
+			tagChangedFunc = func(config *Config) (bool, string, string, error) {
+				if tt.wantErr {
+					return false, "", "", fmt.Errorf("%s", tt.errContains)
+				}
+				return true, "1.0.0", "0.9.0", nil
+			}
+			defer func() {
+				tagChangedFunc = originalTagChanged
+			}()
+
 			originalPullImageToDirFunc := pullImageToDirFunc
 			pullImageToDirCalled := false
-			pullImageToDirFunc = func(config *Config, tag, destDir string) error {
+			pullImageToDirFunc = func(config *Config, tag, destDir string) (map[string]string, error) {
 				pullImageToDirCalled = true
-				// Create files in test temp dir instead of /tmp
-				testDestDir := testTempDir + "/image-" + sanitizePath(tag)
-				if err := os.MkdirAll(testDestDir, 0755); err != nil {
-					return err
+				// Create a dummy file and return its checksum
+				if err := os.MkdirAll(destDir, 0755); err != nil {
+					return nil, err
 				}
-				mockFile := testDestDir + "/test-policy.yaml"
+				mockFile := filepath.Join(destDir, "test-policy.yaml")
 				if err := os.WriteFile(mockFile, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test\n"), 0644); err != nil {
-					return err
+					return nil, err
 				}
-				// Call applyManifests with the test dir
-				return applyManifestsFunc(config, testDestDir)
+				return map[string]string{mockFile: "dummy-checksum"}, nil
 			}
 			defer func() {
 				pullImageToDirFunc = originalPullImageToDirFunc
 			}()
 
-			// Mock kubectl apply to avoid actual execution
 			originalApplyManifestsFunc := applyManifestsFunc
 			applyManifestsCalled := false
-			applyManifestsFunc = func(config *Config, dir string) error {
+			applyManifestsFunc = func(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
 				applyManifestsCalled = true
 				return nil
 			}
 			defer func() {
 				applyManifestsFunc = originalApplyManifestsFunc
 			}()
+
+			originalGetK8sClients := getKubernetesClientsFunc
+			getKubernetesClientsFunc = func() (dynamic.Interface, meta.RESTMapper, error) {
+				return nil, nil, nil
+			}
+			defer func() { getKubernetesClientsFunc = originalGetK8sClients }()
 
 			config := &Config{
 				Provider:  tt.provider,
@@ -554,11 +570,14 @@ func TestWatchLoopProviderBehavior(t *testing.T) {
 					t.Error("watchLoop() should not have called applyManifests for validation error")
 				}
 			} else {
+				if err != nil {
+					t.Fatalf("watchLoop() returned unexpected error: %v", err)
+				}
 				// For successful validation, functions should have been called
-				if !pullImageToDirCalled && err == nil {
+				if !pullImageToDirCalled {
 					t.Error("watchLoop() should have called pullImageToDir")
 				}
-				if !applyManifestsCalled && err == nil {
+				if !applyManifestsCalled {
 					t.Error("watchLoop() should have called applyManifests")
 				}
 			}
@@ -924,7 +943,7 @@ metadata:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := addLabelsToYAML([]byte(tt.inputYAML), tt.tag, tt.artifactName, "dummy-checksum")
+			result, err := addLabelsToYAML([]byte(tt.inputYAML), tt.tag, tt.artifactName, strings.Repeat("a", 48))
 			if err != nil {
 				t.Fatalf("addLabelsToYAML() error = %v", err)
 			}
@@ -959,4 +978,140 @@ metadata:
 // yamlUnmarshal wraps yaml.Unmarshal for testing
 func yamlUnmarshal(data []byte, v interface{}) error {
 	return yaml.Unmarshal(data, v)
+}
+
+func TestWatchLoopReconciliationLogic(t *testing.T) {
+	tests := []struct {
+		name                         string
+		reconcileFromChecksumEnabled bool
+		tagIsChanged                 bool
+		checksumsAreChanged          bool
+		expectPull                   bool
+		expectChecksumCheck          bool
+		expectApply                  bool
+		expectedAppliedFileCount     int // -1 for all, 0 for none, >0 for specific count
+	}{
+		{
+			name:                         "tag changed",
+			reconcileFromChecksumEnabled: false,
+			tagIsChanged:                 true,
+			checksumsAreChanged:          false, // doesn't matter
+			expectPull:                   true,
+			expectChecksumCheck:          false, // logic is skipped
+			expectApply:                  true,
+			expectedAppliedFileCount:     2, // applies all
+		},
+		{
+			name:                         "tag not changed, checksum disabled",
+			reconcileFromChecksumEnabled: false,
+			tagIsChanged:                 false,
+			checksumsAreChanged:          false,
+			expectPull:                   false,
+			expectChecksumCheck:          false,
+			expectApply:                  false,
+			expectedAppliedFileCount:     0,
+		},
+		{
+			name:                         "tag not changed, checksum enabled, no changes",
+			reconcileFromChecksumEnabled: true,
+			tagIsChanged:                 false,
+			checksumsAreChanged:          false,
+			expectPull:                   true,
+			expectChecksumCheck:          true,
+			expectApply:                  false,
+			expectedAppliedFileCount:     0,
+		},
+		{
+			name:                         "tag not changed, checksum enabled, changes found",
+			reconcileFromChecksumEnabled: true,
+			tagIsChanged:                 false,
+			checksumsAreChanged:          true,
+			expectPull:                   true,
+			expectChecksumCheck:          true,
+			expectApply:                  true,
+			expectedAppliedFileCount:     1, // applies one of two
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// --- Mock setup ---
+			var pullCalled, checksumCheckCalled, applyCalled bool
+			var appliedFiles []string
+
+			// Mock getKubernetesClients to return nil as it's not used by the functions under test
+			originalGetK8sClients := getKubernetesClientsFunc
+			getKubernetesClientsFunc = func() (dynamic.Interface, meta.RESTMapper, error) {
+				return nil, nil, nil
+			}
+			defer func() { getKubernetesClientsFunc = originalGetK8sClients }()
+
+			// Mock tagChangedFunc
+			originalTagChangedFunc := tagChangedFunc
+			tagChangedFunc = func(config *Config) (bool, string, string, error) {
+				return tt.tagIsChanged, "v1.0.0", "v0.9.0", nil
+			}
+			defer func() { tagChangedFunc = originalTagChangedFunc }()
+
+			// Mock pullImageToDirFunc
+			originalPullImageToDirFunc := pullImageToDirFunc
+			pullImageToDirFunc = func(config *Config, tag, destDir string) (map[string]string, error) {
+				pullCalled = true
+				return map[string]string{
+					"file1.yaml": "checksum1",
+					"file2.yaml": "checksum2",
+				}, nil
+			}
+			defer func() { pullImageToDirFunc = originalPullImageToDirFunc }()
+
+			// Mock checksumsChanged
+			originalChecksumsChanged := checksumsChangedFunc
+			checksumsChangedFunc = func(newChecksums map[string]string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) (bool, []string, error) {
+				checksumCheckCalled = true
+				if tt.checksumsAreChanged {
+					return true, []string{"file1.yaml"}, nil
+				}
+				return false, nil, nil
+			}
+			defer func() { checksumsChangedFunc = originalChecksumsChanged }()
+
+			// Mock applyManifestsFunc
+			originalApplyManifestsFunc := applyManifestsFunc
+			applyManifestsFunc = func(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
+				applyCalled = true
+				appliedFiles = files
+				return nil
+			}
+			defer func() { applyManifestsFunc = originalApplyManifestsFunc }()
+
+			// --- Test execution ---
+			config := &Config{
+				ReconcilePoliciesFromChecksum: tt.reconcileFromChecksumEnabled,
+				StateDir:                      t.TempDir(),
+			}
+			config.LastFile = filepath.Join(config.StateDir, "last_tag")
+
+			err := watchLoop(config)
+			if err != nil {
+				t.Fatalf("watchLoop() returned an unexpected error: %v", err)
+			}
+
+			// --- Assertions ---
+			if pullCalled != tt.expectPull {
+				t.Errorf("pullImageToDirFunc called = %v, want %v", pullCalled, tt.expectPull)
+			}
+			if checksumCheckCalled != tt.expectChecksumCheck {
+				t.Errorf("checksumsChanged called = %v, want %v", checksumCheckCalled, tt.expectChecksumCheck)
+			}
+			if applyCalled != tt.expectApply {
+				t.Errorf("applyManifestsFunc called = %v, want %v", applyCalled, tt.expectApply)
+			}
+
+			if tt.expectApply {
+				if len(appliedFiles) != tt.expectedAppliedFileCount {
+					t.Errorf("expected %d files to be applied, but got %d", tt.expectedAppliedFileCount, len(appliedFiles))
+				}
+			}
+		})
+	}
 }
