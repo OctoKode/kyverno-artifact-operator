@@ -12,7 +12,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/dynamic"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -882,102 +881,6 @@ func TestVersion(t *testing.T) {
 		t.Errorf("Version = %q, want %q", Version, "test-1.0.0")
 	}
 	Version = oldVersion
-}
-
-func TestAddLabelsToYAML(t *testing.T) {
-	tests := []struct {
-		name             string
-		inputYAML        string
-		tag              string
-		artifactName     string
-		expectManagedBy  string
-		expectVersion    string
-		expectArtifact   string
-		expectNoArtifact bool
-	}{
-		{
-			name: "add all labels to manifest",
-			inputYAML: `apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: require-labels
-spec:
-  validationFailureAction: enforce
-`,
-			tag:             "v1.0.0",
-			artifactName:    "my-artifact",
-			expectManagedBy: "kyverno-watcher",
-			expectVersion:   "v1.0.0",
-			expectArtifact:  "my-artifact",
-		},
-		{
-			name: "add labels without artifact name",
-			inputYAML: `apiVersion: kyverno.io/v1
-kind: Policy
-metadata:
-  name: test-policy
-  namespace: default
-`,
-			tag:              "v2.0.0",
-			artifactName:     "",
-			expectManagedBy:  "kyverno-watcher",
-			expectVersion:    "v2.0.0",
-			expectNoArtifact: true,
-		},
-		{
-			name: "preserve existing labels",
-			inputYAML: `apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: existing-policy
-  labels:
-    existing-label: existing-value
-`,
-			tag:             "v3.0.0",
-			artifactName:    "test-artifact",
-			expectManagedBy: "kyverno-watcher",
-			expectVersion:   "v3.0.0",
-			expectArtifact:  "test-artifact",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := addLabelsToYAML([]byte(tt.inputYAML), tt.tag, tt.artifactName, strings.Repeat("a", 48))
-			if err != nil {
-				t.Fatalf("addLabelsToYAML() error = %v", err)
-			}
-
-			// Parse the result back to check labels
-			var manifest Manifest
-			if err := yamlUnmarshal(result, &manifest); err != nil {
-				t.Fatalf("Failed to parse result YAML: %v", err)
-			}
-
-			if manifest.Metadata.Labels["managed-by"] != tt.expectManagedBy {
-				t.Errorf("Expected managed-by=%q, got %q", tt.expectManagedBy, manifest.Metadata.Labels["managed-by"])
-			}
-
-			if manifest.Metadata.Labels["policy-version"] != tt.expectVersion {
-				t.Errorf("Expected policy-version=%q, got %q", tt.expectVersion, manifest.Metadata.Labels["policy-version"])
-			}
-
-			if tt.expectNoArtifact {
-				if _, exists := manifest.Metadata.Labels["artifact-name"]; exists {
-					t.Error("Expected no artifact-name label, but it was present")
-				}
-			} else {
-				if manifest.Metadata.Labels["artifact-name"] != tt.expectArtifact {
-					t.Errorf("Expected artifact-name=%q, got %q", tt.expectArtifact, manifest.Metadata.Labels["artifact-name"])
-				}
-			}
-		})
-	}
-}
-
-// yamlUnmarshal wraps yaml.Unmarshal for testing
-func yamlUnmarshal(data []byte, v interface{}) error {
-	return yaml.Unmarshal(data, v)
 }
 
 func TestWatchLoopReconciliationLogic(t *testing.T) {

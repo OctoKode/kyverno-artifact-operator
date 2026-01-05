@@ -2,6 +2,9 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -11,13 +14,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
 	"sigs.k8s.io/yaml"
 )
+
+// calculateSHA256 returns the SHA256 checksum of the given data as a hexadecimal string.
+func calculateSHA256(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
 
 // checksumsChanged compares the checksums of freshly pulled manifests against
 // the versions in the cluster. It returns true if any manifest is new or has changed,
@@ -32,17 +40,13 @@ func checksumsChanged(newChecksums map[string]string, dynamicClient dynamic.Inte
 			log.Printf("Warning: failed to read file %s for checksum comparison: %v\n", file, err)
 			continue
 		}
-		var manifest Manifest
+		var manifest unstructured.Unstructured
 		if err := yaml.Unmarshal(fileContent, &manifest); err != nil {
 			log.Printf("Warning: failed to unmarshal YAML from %s: %v\n", file, err)
 			continue
 		}
 
-		gvk := schema.GroupVersionKind{
-			Group:   strings.Split(manifest.APIVersion, "/")[0],
-			Version: strings.Split(manifest.APIVersion, "/")[1],
-			Kind:    manifest.Kind,
-		}
+		gvk := manifest.GroupVersionKind()
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
 			log.Printf("Warning: failed to get REST mapping for %s: %v\n", gvk.String(), err)
@@ -51,29 +55,43 @@ func checksumsChanged(newChecksums map[string]string, dynamicClient dynamic.Inte
 
 		var existingPolicy *unstructured.Unstructured
 		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Namespace(manifest.Metadata.Namespace).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Namespace(manifest.GetNamespace()).Get(context.Background(), manifest.GetName(), metav1.GetOptions{})
 		} else {
-			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Get(context.Background(), manifest.Metadata.Name, metav1.GetOptions{})
+			existingPolicy, err = dynamicClient.Resource(mapping.Resource).Get(context.Background(), manifest.GetName(), metav1.GetOptions{})
 		}
 
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
-				log.Printf("Policy %s/%s not found. Adding to apply list.\n", manifest.Metadata.Namespace, manifest.Metadata.Name)
+				log.Printf("Policy %s/%s not found. Adding to apply list.\n", manifest.GetNamespace(), manifest.GetName())
 				filesToApply = append(filesToApply, file)
 				changed = true
 			} else {
-				log.Printf("Warning: failed to get existing policy %s/%s: %v\n", manifest.Metadata.Namespace, manifest.Metadata.Name, err)
+				log.Printf("Warning: failed to get existing policy %s/%s: %v\n", manifest.GetNamespace(), manifest.GetName(), err)
 			}
 			continue
 		}
 
-		existingChecksum := existingPolicy.GetLabels()["policy-checksum"]
+		existingSpec, found, err := unstructured.NestedFieldNoCopy(existingPolicy.Object, "spec")
+		if !found || err != nil {
+			log.Printf("Warning: 'spec' field not found in existing policy %s/%s. %v\n", manifest.GetNamespace(), manifest.GetName(), err)
+			filesToApply = append(filesToApply, file)
+			changed = true
+			continue
+		}
+
+		existingSpecBytes, err := json.Marshal(existingSpec)
+		if err != nil {
+			log.Printf("Warning: failed to marshal spec for existing policy %s/%s: %v\n", manifest.GetNamespace(), manifest.GetName(), err)
+			continue
+		}
+		existingChecksum := calculateSHA256(existingSpecBytes)[:48]
+
 		if newChecksum != existingChecksum {
-			log.Printf("Policy %s/%s content changed (old checksum: %s, new checksum: %s). Adding to apply list.\n", manifest.Metadata.Namespace, manifest.Metadata.Name, existingChecksum, newChecksum)
+			log.Printf("Policy %s/%s content changed (old checksum: %s, new checksum: %s). Adding to apply list.\n", manifest.GetNamespace(), manifest.GetName(), existingChecksum, newChecksum)
 			filesToApply = append(filesToApply, file)
 			changed = true
 		} else {
-			log.Printf("Policy %s/%s unchanged (checksum: %s). Skipping.\n", manifest.Metadata.Namespace, manifest.Metadata.Name, newChecksum)
+			log.Printf("Policy %s/%s unchanged (checksum: %s). Skipping.\n", manifest.GetNamespace(), manifest.GetName(), newChecksum)
 		}
 	}
 

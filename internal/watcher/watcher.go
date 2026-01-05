@@ -2,8 +2,6 @@ package watcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,12 +53,6 @@ var (
 	// checksumsChangedFunc can be overridden in tests
 	checksumsChangedFunc = checksumsChanged
 )
-
-// calculateSHA256 returns the SHA256 checksum of the given data as a hexadecimal string.
-func calculateSHA256(data []byte) string {
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:])
-}
 
 // Run starts the artifact watcher
 func Run(version string) {
@@ -433,12 +425,48 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 			log.Printf("Warning: failed to read file %s for checksum calculation: %v\n", f, err)
 			continue
 		}
-		checksum := calculateSHA256(data)
+
+		var obj unstructured.Unstructured
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			log.Printf("Warning: could not unmarshal yaml for %s: %v", f, err)
+			continue
+		}
+
+		var checksum string
+		spec, found, err := unstructured.NestedFieldNoCopy(obj.Object, "spec")
+		if !found || err != nil {
+			log.Printf("Warning: 'spec' field not found or error in %s, falling back to full content checksum. %v\n", f, err)
+			checksum = calculateSHA256(data)
+		} else {
+			specBytes, err := json.Marshal(spec)
+			if err != nil {
+				log.Printf("Warning: could not marshal spec for %s: %v", f, err)
+				continue
+			}
+			checksum = calculateSHA256(specBytes)
+		}
 		manifestChecksums[f] = checksum[:48]
 
-		if err := addLabelsToManifest(f, tag, config.ArtifactName, checksum); err != nil {
-			log.Printf("Warning: failed to add labels to %s: %v\n", f, err)
-			// Don't fail - continue with other files
+		labels := obj.GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels["managed-by"] = "kyverno-watcher"
+		labels["policy-version"] = tag
+		if config.ArtifactName != "" {
+			labels["artifact-name"] = config.ArtifactName
+		}
+		labels["policy-checksum"] = checksum[:48]
+		obj.SetLabels(labels)
+
+		updatedData, err := yaml.Marshal(&obj)
+		if err != nil {
+			log.Printf("Warning: could not marshal updated yaml for %s: %v", f, err)
+			continue
+		}
+
+		if err := os.WriteFile(f, updatedData, 0644); err != nil {
+			log.Printf("Warning: failed to write updated manifest to %s: %v\n", f, err)
 			continue
 		}
 	}
@@ -516,54 +544,6 @@ func orasPull(config *Config, destDir string) error {
 	}
 
 	return nil
-}
-
-func addLabelsToManifest(filePath, tag, artifactName, checksum string) error {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("reading file: %w", err)
-	}
-
-	// Add labels to the YAML content
-	updatedData, err := addLabelsToYAML(data, tag, artifactName, checksum)
-	if err != nil {
-		return fmt.Errorf("adding labels: %w", err)
-	}
-
-	// Write back to the same file
-	if err := os.WriteFile(filePath, updatedData, 0644); err != nil {
-		return fmt.Errorf("writing file: %w", err)
-	}
-
-	return nil
-}
-
-func addLabelsToYAML(yamlData []byte, tag, artifactName, checksum string) ([]byte, error) {
-	var manifest Manifest
-	if err := yaml.Unmarshal(yamlData, &manifest); err != nil {
-		return nil, fmt.Errorf("unmarshaling YAML: %w", err)
-	}
-
-	// Initialize labels map if it doesn't exist
-	if manifest.Metadata.Labels == nil {
-		manifest.Metadata.Labels = make(map[string]string)
-	}
-
-	// Add our labels
-	manifest.Metadata.Labels["managed-by"] = "kyverno-watcher"
-	manifest.Metadata.Labels["policy-version"] = tag
-	if artifactName != "" {
-		manifest.Metadata.Labels["artifact-name"] = artifactName
-	}
-	manifest.Metadata.Labels["policy-checksum"] = checksum[:48]
-
-	// Marshal back to YAML
-	updatedData, err := yaml.Marshal(&manifest)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling YAML: %w", err)
-	}
-
-	return updatedData, nil
 }
 
 func pullOCI(ctx context.Context, imageRef, outputDir string) error {
