@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/OctoKode/kyverno-artifact-operator/internal/k8s"
+	"github.com/google/go-containerregistry/pkg/name"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -101,11 +102,45 @@ func checksumsChanged(newChecksums map[string]string, dynamicClient dynamic.Inte
 // tagChanged checks if the artifact tag has changed since the last check.
 // It returns true if the tag is new, the latest tag, the previous tag, and any error.
 func tagChanged(config *Config) (bool, string, string, error) {
+	// If polling is disabled, we just want to process the given tag once.
+	if config.PollInterval == 0 {
+		ref, err := name.ParseReference(config.ImageBase)
+		if err != nil {
+			return false, "", "", fmt.Errorf("invalid ImageBase: %w", err)
+		}
+		tag := ref.Identifier()
+
+		// If no tag is specified in the URL ("latest" or empty), fetch the actual latest one.
+		if tag == "latest" || tag == "" {
+			var latest string
+			var err error
+			if config.Provider == ProviderGitHub {
+				latest, err = getLatestTagOrDigestFunc(config)
+			} else {
+				latest, err = getLatestArtifactoryTagFunc(config)
+			}
+			if err != nil {
+				return false, "", "", fmt.Errorf("could not determine latest tag: %w", err)
+			}
+			if latest == "" {
+				log.Println("No versions found for package")
+				return false, "", "", nil
+			}
+			// We always want to process this on a single run.
+			return true, latest, "", nil
+		}
+
+		// A specific tag is in the URL, use it.
+		// We always want to process this on a single run.
+		return true, tag, "", nil
+	}
+
+	// Polling is enabled, use existing logic to check for changes.
 	var latest string
 	var err error
 
 	if config.Provider == ProviderGitHub {
-		latest, err = getLatestTagOrDigest(config)
+		latest, err = getLatestTagOrDigestFunc(config)
 		if err != nil {
 			return false, "", "", fmt.Errorf("could not determine latest tag/digest: %w", err)
 		}
@@ -122,7 +157,7 @@ func tagChanged(config *Config) (bool, string, string, error) {
 			latest = parts[len(parts)-1]
 		} else {
 			// No specific version or "latest" tag - query Artifactory for latest version
-			latest, err = getLatestArtifactoryTag(config)
+			latest, err = getLatestArtifactoryTagFunc(config)
 			if err != nil {
 				return false, "", "", fmt.Errorf("could not determine latest Artifactory tag: %w", err)
 			}

@@ -52,6 +52,10 @@ var (
 	getKubernetesClientsFunc = getKubernetesClients
 	// checksumsChangedFunc can be overridden in tests
 	checksumsChangedFunc = checksumsChanged
+	// getLatestTagOrDigestFunc can be overridden in tests
+	getLatestTagOrDigestFunc = getLatestTagOrDigestReal
+	// getLatestArtifactoryTagFunc can be overridden in tests
+	getLatestArtifactoryTagFunc = getLatestArtifactoryTagReal
 )
 
 // Run starts the artifact watcher
@@ -89,6 +93,16 @@ func Run(version string) {
 			config.ImageBase, config.Owner, config.Package)
 	} else {
 		log.Printf("Starting Artifactory watcher for %s\n", config.ImageBase)
+	}
+
+	if config.PollInterval == 0 {
+		log.Println("Polling disabled. Running once.")
+		if err := watchLoop(config); err != nil {
+			log.Printf("Error during single run: %v", err)
+		}
+		log.Println("Single run complete. Waiting indefinitely.")
+		// Block forever. A select with no cases blocks forever.
+		select {}
 	}
 
 	for {
@@ -237,7 +251,7 @@ func watchLoop(config *Config) error {
 	return nil
 }
 
-func getLatestTagOrDigest(config *Config) (string, error) {
+func getLatestTagOrDigestReal(config *Config) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/%s/%s/packages/container/%s/versions",
 		config.GithubAPIOwnerType, config.Owner, config.PackageNormalized)
 
@@ -311,7 +325,7 @@ func getLatestTagOrDigest(config *Config) (string, error) {
 	return fmt.Sprintf("version-id-%d", latest.ID), nil
 }
 
-func getLatestArtifactoryTag(config *Config) (string, error) {
+func getLatestArtifactoryTagReal(config *Config) (string, error) {
 	// Parse the image base to extract registry, repository path
 	// Expected format: registry.example.com/repo/path or registry.example.com/repo/path:tag
 	imageBase := strings.Split(config.ImageBase, ":")[0]

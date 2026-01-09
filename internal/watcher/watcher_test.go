@@ -1018,3 +1018,97 @@ func TestWatchLoopReconciliationLogic(t *testing.T) {
 		})
 	}
 }
+
+func TestTagChanged_PollingDisabled(t *testing.T) {
+	tests := []struct {
+		name          string
+		imageBase     string
+		provider      string
+		mockLatestTag string // For when imageBase has no tag
+		expectChange  bool
+		expectedTag   string
+		expectErr     bool
+	}{
+		{
+			name:         "URL with specific tag",
+			imageBase:    "ghcr.io/owner/repo:v1.2.3",
+			provider:     ProviderGitHub,
+			expectChange: true,
+			expectedTag:  "v1.2.3",
+			expectErr:    false,
+		},
+		{
+			name:          "URL without tag, github provider",
+			imageBase:     "ghcr.io/owner/repo",
+			provider:      ProviderGitHub,
+			mockLatestTag: "v2.0.0",
+			expectChange:  true,
+			expectedTag:   "v2.0.0",
+			expectErr:     false,
+		},
+		{
+			name:          "URL with 'latest' tag, artifactory provider",
+			imageBase:     "my-artifactory/repo:latest",
+			provider:      ProviderArtifactory,
+			mockLatestTag: "v3.0.0",
+			expectChange:  true,
+			expectedTag:   "v3.0.0",
+			expectErr:     false,
+		},
+		{
+			name:          "URL without tag, no latest found",
+			imageBase:     "ghcr.io/owner/repo",
+			provider:      ProviderGitHub,
+			mockLatestTag: "", // Simulate no tags found
+			expectChange:  false,
+			expectedTag:   "",
+			expectErr:     false, // Should not error, just return no change
+		},
+		{
+			name:         "Invalid ImageBase",
+			imageBase:    "invalid-url:",
+			provider:     ProviderGitHub,
+			expectChange: false,
+			expectedTag:  "",
+			expectErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Mock getLatestTagOrDigest and getLatestArtifactoryTag
+			originalGetLatestTagOrDigest := getLatestTagOrDigestFunc
+			getLatestTagOrDigestFunc = func(config *Config) (string, error) {
+				return tt.mockLatestTag, nil
+			}
+			defer func() { getLatestTagOrDigestFunc = originalGetLatestTagOrDigest }()
+
+			originalGetLatestArtifactoryTag := getLatestArtifactoryTagFunc
+			getLatestArtifactoryTagFunc = func(config *Config) (string, error) {
+				return tt.mockLatestTag, nil
+			}
+			defer func() { getLatestArtifactoryTagFunc = originalGetLatestArtifactoryTag }()
+
+			config := &Config{
+				PollInterval: 0, // Polling disabled
+				ImageBase:    tt.imageBase,
+				Provider:     tt.provider,
+			}
+
+			changed, latest, _, err := tagChanged(config)
+
+			if (err != nil) != tt.expectErr {
+				t.Errorf("tagChanged() error = %v, wantErr %v", err, tt.expectErr)
+				return
+			}
+
+			if changed != tt.expectChange {
+				t.Errorf("tagChanged() changed = %v, want %v", changed, tt.expectChange)
+			}
+
+			if latest != tt.expectedTag {
+				t.Errorf("tagChanged() latest = %q, want %q", latest, tt.expectedTag)
+			}
+		})
+	}
+}

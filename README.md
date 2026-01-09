@@ -50,9 +50,13 @@ kind: KyvernoArtifact
 metadata:
   name: my-policies
 spec:
+  # url can include a specific tag to start from (e.g., ghcr.io/YOUR_ORG/YOUR_POLICIES:v1.0.0).
+  # If no tag is specified, 'latest' is used.
   url: ghcr.io/YOUR_ORG/YOUR_POLICIES:latest
   type: oci
   provider: github
+  # pollingInterval is the interval in seconds to check for new tags.
+  # Set to 0 to disable polling and only sync the tag specified in the url.
   pollingInterval: 60
   # deletePoliciesOnTermination specifies whether policies created by this artifact should be automatically deleted when the watcher pod terminates.
   # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.
@@ -73,9 +77,13 @@ kind: KyvernoArtifact
 metadata:
   name: my-artifactory-policies
 spec:
+  # url can include a specific tag to start from (e.g., artifactory.example.com/docker-local/policies:v1.0.0).
+  # If no tag is specified, 'latest' is used.
   url: artifactory.example.com/docker-local/policies:latest
   type: oci
   provider: artifactory
+  # pollingInterval is the interval in seconds to check for new tags.
+  # Set to 0 to disable polling and only sync the tag specified in the url.
   pollingInterval: 60
   # deletePoliciesOnTermination specifies whether policies created by this artifact should be automatically deleted when the watcher pod terminates.
   # Defaults to false. Can be overridden by the WATCHER_DELETE_POLICIES_ON_TERMINATION environment variable.

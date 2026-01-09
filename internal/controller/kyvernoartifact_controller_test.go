@@ -516,6 +516,82 @@ func TestReconcileKyvernoArtifact_WithCustomPollInterval(t *testing.T) {
 	}
 }
 
+func TestReconcileKyvernoArtifact_WithZeroPollInterval(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = kyvernov1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	artifact := &kyvernov1alpha1.KyvernoArtifact{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-artifact-zero-poll",
+			Namespace: "default",
+			UID:       "test-uid-456",
+		},
+		Spec: kyvernov1alpha1.KyvernoArtifactSpec{
+			ArtifactUrl:      ptrString("ghcr.io/owner/package:v1.0.0"),
+			ArtifactProvider: ptrString("github"),
+			PollingInterval:  ptrInt32(0),
+		},
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kyverno-watcher-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"github-token": []byte("test-token"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(artifact, secret).
+		Build()
+
+	reconciler := &KyvernoArtifactReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+		Config: DefaultConfig(),
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-artifact-zero-poll",
+			Namespace: "default",
+		},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Errorf("Reconcile() error = %v, want nil", err)
+	}
+
+	// Verify pod has correct POLL_INTERVAL
+	var pods corev1.PodList
+	err = fakeClient.List(context.Background(), &pods, client.InNamespace("default"))
+	if err != nil {
+		t.Fatalf("Failed to list pods: %v", err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("Expected 1 pod, got %d", len(pods.Items))
+	}
+
+	container := pods.Items[0].Spec.Containers[0]
+	pollIntervalEnv := ""
+	for _, env := range container.Env {
+		if env.Name == "POLL_INTERVAL" {
+			pollIntervalEnv = env.Value
+			break
+		}
+	}
+
+	if pollIntervalEnv != "0" {
+		t.Errorf("Pod POLL_INTERVAL = %q, want %q", pollIntervalEnv, "0")
+	}
+}
+
 func TestSetupWithManager(t *testing.T) {
 	// This is a basic test to ensure SetupWithManager doesn't panic
 	// A full integration test would require a real manager

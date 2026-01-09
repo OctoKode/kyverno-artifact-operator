@@ -7,8 +7,12 @@ metadata:
   name: kyvernoartifact-sample
   namespace: kyverno-artifact-operator-system
 spec:
+  # url can include a specific tag to start from (e.g., ghcr.io/myoung34/kyverno-test/policies:v0.0.1).
+  # If no tag is specified, 'latest' is used.
   url: ghcr.io/myoung34/kyverno-test/policies
   type: oci
   provider: github
+  # pollingInterval is the interval in seconds to check for new tags.
+  # Set to 0 to disable polling and only sync the tag specified in the url.
   pollingInterval: 60
   reconcilePoliciesFromChecksum: false

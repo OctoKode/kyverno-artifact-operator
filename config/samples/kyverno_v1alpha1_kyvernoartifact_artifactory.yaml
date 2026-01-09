@@ -7,8 +7,12 @@ metadata:
   name: kyvernoartifact-artifactory-sample
   namespace: kyverno-artifact-operator-system
 spec:
+  # url can include a specific tag to start from (e.g., trialwhj9in.jfrog.io/kyverno-oci-local/kyverno-oci:1.0.0).
+  # If no tag is specified, 'latest' is used.
   url: trialwhj9in.jfrog.io/kyverno-oci-local/kyverno-oci
   type: oci
   provider: artifactory
+  # pollingInterval is the interval in seconds to check for new tags.
+  # Set to 0 to disable polling and only sync the tag specified in the url.
   pollingInterval: 60
   reconcilePoliciesFromChecksum: false
