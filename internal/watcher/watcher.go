@@ -219,21 +219,14 @@ func watchLoop(config *Config) error {
 		latest = tag
 		// Read the last successfully applied tag from the state file.
 		last, err := os.ReadFile(config.LastFile)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// If the state file doesn't exist, this is the first run. We treat this as a "change"
-				// to ensure that the policies from the pinned tag are applied at least once.
-				isTagChanged = true // First run, apply manifests
-				prevTag = ""
-			} else {
-				return fmt.Errorf("failed to read last file: %w", err)
-			}
-		} else {
-			prevTag = string(last)
-			// A "change" is detected if the tag in the IMAGE_BASE is different from the last applied tag.
-			// This allows users to manually update the pinned version by changing the env var and restarting the pod.
-			isTagChanged = (latest != prevTag)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read last file: %w", err)
 		}
+		prevTag = string(last)
+
+		// In pinned mode, a "change" is only when the tag in IMAGE_BASE is different from the last applied tag.
+		// If lastFile doesn't exist, we don't treat it as a change, because the reconciliation logic will handle it.
+		isTagChanged = (latest != prevTag && prevTag != "")
 	}
 
 	// The most common case is that nothing has changed. If the tag is the same and checksum-based

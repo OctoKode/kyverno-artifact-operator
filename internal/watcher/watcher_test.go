@@ -1228,9 +1228,10 @@ func TestWatchLoop_PollingDisabled(t *testing.T) {
 			name:                         "polling disabled, first run with tagged image",
 			imageBase:                    "ghcr.io/owner/image:v1.0.0",
 			lastSeenTag:                  "", // No last_seen file
+			checksumsAreChanged:          true,
 			reconcileFromChecksumEnabled: true,
 			expectPull:                   true,
-			expectChecksumCheck:          false, // isTagChanged is true, so this is skipped
+			expectChecksumCheck:          true, // isTagChanged is false, so this is now checked
 			expectApply:                  true,
 		},
 		{
