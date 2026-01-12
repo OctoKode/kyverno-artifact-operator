@@ -17,3 +17,8 @@ spec:
   pollingInterval: 60
   deletePoliciesOnTermination: true
   reconcilePoliciesFromChecksum: false
+  # pollForTagChanges enables or disables polling for new image tags.
+  # If set to false, the watcher will only use the specific tag provided in the 'url' field and will not look for newer tags.
+  # This is useful for pinning to a specific version while still benefiting from checksum-based reconciliation.
+  # Defaults to true.
+  pollForTagChanges: true

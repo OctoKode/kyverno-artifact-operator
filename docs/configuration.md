@@ -22,6 +22,20 @@ The following environment variables can be set on the controller deployment to o
 | `ARTIFACTORY_USERNAME_KEY` | Secret key for Artifactory username | `artifactory-username` |
 | `ARTIFACTORY_PASSWORD_KEY` | Secret key for Artifactory password | `artifactory-password` |
 
+## KyvernoArtifact Spec
+
+The `KyvernoArtifact` custom resource has the following fields in its `spec`:
+
+| Field                         | Description                                                                                                                                                                             | Default    |
+|-------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|
+| `url`                         | The OCI URL of the artifact to sync. You can pin to a specific version by including a tag (e.g., `:v1.2.3`).                                                                              | (required) |
+| `type`                        | The type of artifact. Currently only `oci` is supported.                                                                                                                                | `oci`      |
+| `provider`                    | The OCI provider, e.g., `github` or `artifactory`.                                                                                                                                      | `github`   |
+| `pollingInterval`             | The interval in seconds at which the watcher polls for new artifact versions.                                                                                                           | `60`       |
+| `deletePoliciesOnTermination` | If `true`, policies created by this artifact will be deleted when the watcher pod is terminated.                                                                                        | `false`    |
+| `reconcilePoliciesFromChecksum` | If `true`, the watcher will reconcile policies based on their content checksum, even if the image tag has not changed.                                                                      | `false`    |
+| `pollForTagChanges`           | If `true`, the watcher will poll for new tags. If `false`, it will only use the tag specified in the `url` field. This is useful for pinning to a specific version while still enabling checksum-based reconciliation. | `true`     |
+
 ## Helm Chart Configuration
 
 When using a Helm chart, these values can be configured in your `values.yaml`:

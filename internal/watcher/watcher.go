@@ -19,6 +19,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -58,15 +59,20 @@ var (
 	getLatestArtifactoryTagFunc = getLatestArtifactoryTagReal
 )
 
-// Run starts the artifact watcher
+// Run starts the artifact watcher. This is the main entry point when the binary is run in watcher mode.
 func Run(version string) {
 	Version = version
 	// Print version
 	log.Printf("Kyverno Artifact Watcher version %s\n", Version)
 
+	// Load configuration from environment variables. This includes registry credentials,
+	// polling intervals, and other operational parameters.
 	config := loadConfig()
 	log.Printf("Using configuration %+v\n", config)
 
+	// If deletion on termination is enabled, set up a signal handler to catch termination signals (like SIGTERM)
+	// This allows the watcher to perform a graceful shutdown and clean up any policies it has created,
+	// preventing orphaned resources in the cluster.
 	if config.DeletePoliciesOnTermination {
 		log.Printf("Deleting policies on termination is enabled.")
 		// Set up signal handling for graceful shutdown
@@ -95,20 +101,13 @@ func Run(version string) {
 		log.Printf("Starting Artifactory watcher for %s\n", config.ImageBase)
 	}
 
-	if config.PollInterval == 0 {
-		log.Println("Polling disabled. Running once.")
-		if err := watchLoop(config); err != nil {
-			log.Printf("Error during single run: %v", err)
-		}
-		log.Println("Single run complete. Waiting indefinitely.")
-		// Block forever. A select with no cases blocks forever.
-		select {}
-	}
-
+	// This is the main reconciliation loop. It will run indefinitely.
 	for {
+		// watchLoop contains the core logic for checking for new artifacts and applying them.
 		if err := watchLoop(config); err != nil {
 			log.Printf("Error in watch loop: %v\n", err)
 		}
+		// Wait for the configured polling interval before the next reconciliation cycle.
 		time.Sleep(time.Duration(config.PollInterval) * time.Second)
 	}
 }
@@ -180,13 +179,65 @@ func deleteResourcesByLabel(dynamicClient dynamic.Interface, gvr schema.GroupVer
 	return nil
 }
 
+// watchLoop is the core reconciliation logic for the watcher.
+// It checks for new artifact versions and applies policies to the cluster.
 func watchLoop(config *Config) error {
-	isTagChanged, latest, prevTag, err := tagChangedFunc(config)
-	if err != nil {
-		return fmt.Errorf("error checking for tag change: %w", err)
+	var isTagChanged bool
+	var latest, prevTag string
+	var err error
+
+	// The behavior of the watcher depends on whether we are polling for new tags or are pinned to a specific tag.
+	if config.PollForTagChanges {
+		// If polling is enabled, check the remote registry for the latest tag.
+		isTagChanged, latest, prevTag, err = tagChangedFunc(config)
+		if err != nil {
+			return fmt.Errorf("error checking for tag change: %w", err)
+		}
+	} else {
+		// If polling is disabled, we operate in "pinned" mode. The watcher will only ever use the tag
+		// specified in the IMAGE_BASE environment variable. This is useful for ensuring that only a specific
+		// version of policies is ever applied, while still allowing for checksum-based reconciliation to fix drift.
+		log.Println("Polling for tag changes is disabled.")
+		var tag string
+		tagFound := false
+		if strings.Contains(config.ImageBase, ":") {
+			parts := strings.Split(config.ImageBase, ":")
+			lastPart := parts[len(parts)-1]
+			// Simple heuristic to avoid matching a port number in the image base URL.
+			if !strings.Contains(lastPart, "/") {
+				tag = lastPart
+				tagFound = true
+			}
+		}
+
+		if !tagFound {
+			// If polling is disabled and no tag is specified in the image URL, there is nothing to do.
+			log.Println("No tag specified in IMAGE_BASE, nothing to do.")
+			return nil
+		}
+
+		latest = tag
+		// Read the last successfully applied tag from the state file.
+		last, err := os.ReadFile(config.LastFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// If the state file doesn't exist, this is the first run. We treat this as a "change"
+				// to ensure that the policies from the pinned tag are applied at least once.
+				isTagChanged = true // First run, apply manifests
+				prevTag = ""
+			} else {
+				return fmt.Errorf("failed to read last file: %w", err)
+			}
+		} else {
+			prevTag = string(last)
+			// A "change" is detected if the tag in the IMAGE_BASE is different from the last applied tag.
+			// This allows users to manually update the pinned version by changing the env var and restarting the pod.
+			isTagChanged = (latest != prevTag)
+		}
 	}
 
-	// Exit early if nothing has changed and checksum reconciliation is disabled
+	// The most common case is that nothing has changed. If the tag is the same and checksum-based
+	// reconciliation is disabled, we can exit early to avoid unnecessary work.
 	if !isTagChanged && !config.ReconcilePoliciesFromChecksum {
 		log.Printf("No change (latest=%s)\n", latest)
 		return nil
@@ -199,6 +250,8 @@ func watchLoop(config *Config) error {
 		return fmt.Errorf("failed to get Kubernetes clients: %w", err)
 	}
 
+	// If a new tag is detected, we must re-apply all policies from the new artifact.
+	// This is the primary mechanism for rolling out new policy versions.
 	if isTagChanged {
 		log.Printf("Detected new tag: previous='%s' new='%s'. Applying all manifests.\n", prevTag, latest)
 		destDir := fmt.Sprintf("/tmp/image-%s", sanitizePath(latest))
@@ -219,20 +272,27 @@ func watchLoop(config *Config) error {
 		appliedSomething = true
 
 	} else if config.ReconcilePoliciesFromChecksum {
+		// If the tag hasn't changed but checksum reconciliation is enabled, we perform a deeper check.
+		// This logic handles cases where the policy content may have changed even though the image tag
+		// is the same (e.g., a mutable tag like 'latest' was overwritten). It also helps to self-heal
+		// if policies in the cluster have been manually modified or deleted.
 		log.Printf("No tag change, but checksum reconciliation is enabled. Checking manifests.\n")
 		destDir := fmt.Sprintf("/tmp/image-%s", sanitizePath(latest))
 
+		// Pull the artifact to get the current "source of truth" checksums.
 		newChecksums, err := pullImageToDirFunc(config, latest, destDir)
 		if err != nil {
 			return fmt.Errorf("pull failed: %w", err)
 		}
 
+		// Compare the checksums from the artifact with the policies currently in the cluster.
 		changed, filesToApply, err := checksumsChangedFunc(newChecksums, dynamicClient, mapper)
 		if err != nil {
 			log.Printf("Error during checksum comparison: %v", err)
 		}
 
 		if changed {
+			// If any discrepancies are found, apply only the manifests that have changed.
 			if err := applyManifestsFunc(config, filesToApply, mapper, dynamicClient); err != nil {
 				return fmt.Errorf("apply manifests failed: %w", err)
 			}
@@ -242,6 +302,8 @@ func watchLoop(config *Config) error {
 		}
 	}
 
+	// If any policies were successfully applied, update the state file with the latest tag.
+	// This file acts as a bookmark, so we know which version is currently running in the cluster.
 	if appliedSomething {
 		if err := os.WriteFile(config.LastFile, []byte(latest), 0644); err != nil {
 			return fmt.Errorf("failed to write last file: %w", err)
@@ -251,7 +313,10 @@ func watchLoop(config *Config) error {
 	return nil
 }
 
+// getLatestTagOrDigestReal fetches the latest tag or digest for a GitHub Container Registry (GHCR) package.
+// It queries the GitHub Packages API to find the most recently updated version.
 func getLatestTagOrDigestReal(config *Config) (string, error) {
+	// Construct the GitHub API URL for listing package versions.
 	apiURL := fmt.Sprintf("https://api.github.com/%s/%s/packages/container/%s/versions",
 		config.GithubAPIOwnerType, config.Owner, config.PackageNormalized)
 
@@ -260,7 +325,9 @@ func getLatestTagOrDigestReal(config *Config) (string, error) {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Authenticate the request using the provided GitHub token.
 	req.Header.Set("Authorization", "token "+config.GithubToken)
+	// Specify the API version to accept.
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
 	client := &http.Client{}
@@ -279,12 +346,12 @@ func getLatestTagOrDigestReal(config *Config) (string, error) {
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Check for non-200 status codes
+	// Handle non-200 HTTP status codes, providing specific error messages for common issues.
 	if resp.StatusCode != http.StatusOK {
 		var errMsg struct {
 			Message string `json:"message"`
 		}
-		_ = json.Unmarshal(body, &errMsg)
+		_ = json.Unmarshal(body, &errMsg) // Attempt to unmarshal error message even if status is not OK.
 
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
@@ -305,10 +372,10 @@ func getLatestTagOrDigestReal(config *Config) (string, error) {
 	}
 
 	if len(versions) == 0 {
-		return "", nil
+		return "", nil // No versions found for the package.
 	}
 
-	// Find the most recently updated version
+	// Find the most recently updated version among all available versions.
 	latest := versions[0]
 	for _, v := range versions {
 		if v.UpdatedAt.After(latest.UpdatedAt) {
@@ -316,20 +383,25 @@ func getLatestTagOrDigestReal(config *Config) (string, error) {
 		}
 	}
 
-	// Prefer tag names if present
+	// Prioritize returning an actual tag name if available.
 	if len(latest.Metadata.Container.Tags) > 0 {
 		return latest.Metadata.Container.Tags[0], nil
 	}
 
-	// Fallback to version ID
+	// As a fallback, return the version ID if no explicit tags are found.
 	return fmt.Sprintf("version-id-%d", latest.ID), nil
 }
 
+// getLatestArtifactoryTagReal fetches the latest tag for an OCI artifact stored in Artifactory.
+// It uses the Artifactory Docker Registry API v2 to list available tags.
 func getLatestArtifactoryTagReal(config *Config) (string, error) {
-	// Parse the image base to extract registry, repository path
-	// Expected format: registry.example.com/repo/path or registry.example.com/repo/path:tag
-	imageBase := strings.Split(config.ImageBase, ":")[0]
-	parts := strings.SplitN(imageBase, "/", 2)
+	// Extract the registry and repository path from the image base.
+	// The imageBase might include a tag, so we strip it first.
+	imageBase := config.ImageBase
+	if strings.Contains(imageBase, ":") {
+		imageBase = strings.Split(imageBase, ":")[0]
+	}
+	parts := strings.SplitN(imageBase, "/", 2) // Split only on the first slash to separate registry from path.
 	if len(parts) < 2 {
 		return "", fmt.Errorf("invalid IMAGE_BASE format for Artifactory: %s", config.ImageBase)
 	}
@@ -337,7 +409,7 @@ func getLatestArtifactoryTagReal(config *Config) (string, error) {
 	registry := parts[0]
 	repoPath := parts[1]
 
-	// Artifactory Docker Registry API v2 endpoint to list tags
+	// Construct the Artifactory Docker Registry API v2 endpoint for listing tags.
 	apiURL := fmt.Sprintf("https://%s/v2/%s/tags/list", registry, repoPath)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
@@ -345,10 +417,11 @@ func getLatestArtifactoryTagReal(config *Config) (string, error) {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Set basic authentication credentials for Artifactory.
 	req.SetBasicAuth(config.Username, config.Password)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json") // Request JSON response.
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second} // Set a timeout for the HTTP request.
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to make API request: %w", err)
@@ -364,6 +437,7 @@ func getLatestArtifactoryTagReal(config *Config) (string, error) {
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	// Check for non-200 status codes from the Artifactory API.
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("artifactory API returned status %d: %s", resp.StatusCode, string(body))
 	}
@@ -377,37 +451,42 @@ func getLatestArtifactoryTagReal(config *Config) (string, error) {
 	}
 
 	if len(tagsResponse.Tags) == 0 {
-		return "", nil
+		return "", nil // No tags found for the repository.
 	}
 
-	// Return the last tag in the list (typically the most recent)
-	// For semantic versioning, you might want to add sorting logic here
+	// Return the last tag in the list. This assumes Artifactory returns tags in a consistently ordered manner
+	// where the last one is the most recent. For more robust semantic versioning, custom sorting might be needed.
 	latestTag := tagsResponse.Tags[len(tagsResponse.Tags)-1]
 	log.Printf("Found latest Artifactory tag: %s from %d available tags", latestTag, len(tagsResponse.Tags))
 
 	return latestTag, nil
 }
 
-//nolint:unused // Used via pullImageToDirFunc for testing
-func pullImageToDir(config *Config, tag, destDir string) (map[string]string, error) {
-	return pullImageToDirFunc(config, tag, destDir)
-}
-
+// pullImageToDirReal handles the actual pulling of the OCI artifact and extracts its contents to a local directory.
+// It supports different pulling mechanisms based on the configured provider.
 func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string, error) {
+	// Clean up any previous extraction in the destination directory to ensure a fresh pull.
 	if err := os.RemoveAll(destDir); err != nil {
 		log.Printf("Warning: failed to remove directory %s: %v", destDir, err)
 	}
+	// Create the destination directory.
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return nil, err
 	}
 
+	// Use ORAS for Artifactory due to specific authentication and registry API requirements.
 	if config.Provider == ProviderArtifactory {
-		// Construct full image reference with tag
-		imageBase := strings.Split(config.ImageBase, ":")[0]
+		// Construct the full image reference (e.g., registry/repo/image:tag).
+		// We ensure the base image name is without a tag before concatenating, to prevent duplicate tags.
+		imageBase := config.ImageBase
+		if strings.Contains(imageBase, ":") {
+			imageBase = strings.Split(imageBase, ":")[0]
+		}
 		imageRef := fmt.Sprintf("%s:%s", imageBase, tag)
 		log.Printf("Pulling image %s into %s using oras...\n", imageRef, destDir)
 
-		// Create a temporary config with the full image reference
+		// Create a temporary config with the full image reference. This might be redundant now,
+		// but historically ORAS pull operations might have needed this.
 		configWithTag := *config
 		configWithTag.ImageBase = imageRef
 
@@ -415,10 +494,15 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 			return nil, fmt.Errorf("oras pull failed: %w", err)
 		}
 	} else {
+		// For other providers (primarily GitHub Container Registry), use the go-containerregistry OCI library.
 		log.Printf("Pulling image %s:%s into %s ...\n", config.ImageBase, tag, destDir)
 
-		// Pull using OCI library
-		imageRef := fmt.Sprintf("%s:%s", config.ImageBase, tag)
+		// Construct the full image reference, ensuring the base image name is without a tag first.
+		imageBase := config.ImageBase
+		if strings.Contains(imageBase, ":") {
+			imageBase = strings.Split(imageBase, ":")[0]
+		}
+		imageRef := fmt.Sprintf("%s:%s", imageBase, tag)
 		ctx := context.Background()
 
 		if err := pullOCI(ctx, imageRef, destDir); err != nil {
@@ -426,7 +510,9 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 		}
 	}
 
-	// Add labels to manifests and calculate checksums
+	// After pulling, process the downloaded YAML manifests.
+	// This involves adding labels (like managed-by, policy-version, artifact-name, policy-checksum)
+	// and calculating checksums for reconciliation.
 	files, err := findYAMLFiles(destDir)
 	if err != nil {
 		return nil, err
@@ -447,6 +533,8 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 		}
 
 		var checksum string
+		// Extract checksum from the 'spec' field if available to avoid changes in metadata
+		// triggering unnecessary updates. Fallback to full content checksum if spec is not found.
 		spec, found, err := unstructured.NestedFieldNoCopy(obj.Object, "spec")
 		if !found || err != nil {
 			log.Printf("Warning: 'spec' field not found or error in %s, falling back to full content checksum. %v\n", f, err)
@@ -459,8 +547,9 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 			}
 			checksum = calculateSHA256(specBytes)
 		}
-		manifestChecksums[f] = checksum[:48]
+		manifestChecksums[f] = checksum[:48] // Store first 48 chars of SHA256
 
+		// Add standard labels to the manifest for tracking and garbage collection.
 		labels := obj.GetLabels()
 		if labels == nil {
 			labels = make(map[string]string)
@@ -473,6 +562,7 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 		labels["policy-checksum"] = checksum[:48]
 		obj.SetLabels(labels)
 
+		// Marshal the updated manifest back to YAML and write it to disk.
 		updatedData, err := yaml.Marshal(&obj)
 		if err != nil {
 			log.Printf("Warning: could not marshal updated yaml for %s: %v", f, err)
@@ -488,16 +578,19 @@ func pullImageToDirReal(config *Config, tag, destDir string) (map[string]string,
 	return manifestChecksums, nil
 }
 
+// pullWithOras is a wrapper for orasPullFunc (used for testing).
 func pullWithOras(config *Config, destDir string) error {
 	return orasPullFunc(config, destDir)
 }
 
+// orasPull pulls an OCI artifact from a registry using the ORAS library.
+// This is primarily used for Artifactory due to its specific authentication requirements.
 func orasPull(config *Config, destDir string) error {
 	log.Printf("Pulling %s to %s using ORAS library\n", config.ImageBase, destDir)
 
 	ctx := context.Background()
 
-	// Create file store for the destination
+	// Create a file store where the pulled artifact layers will be extracted.
 	fs, err := file.New(destDir)
 	if err != nil {
 		return fmt.Errorf("failed to create file store: %w", err)
@@ -508,16 +601,16 @@ func orasPull(config *Config, destDir string) error {
 		}
 	}()
 
-	// Parse the image reference to get tag
+	// The reference includes the registry, repository, and tag/digest.
 	ref := config.ImageBase
 
-	// Create repository
+	// Create an ORAS remote repository client.
 	repo, err := orasremote.NewRepository(ref)
 	if err != nil {
 		return fmt.Errorf("failed to create repository: %w", err)
 	}
 
-	// Set up authentication with static credentials
+	// Set up authentication for the ORAS client using the provided username and password.
 	repo.Client = &auth.Client{
 		Client: retry.DefaultClient,
 		Cache:  auth.NewCache(),
@@ -529,15 +622,15 @@ func orasPull(config *Config, destDir string) error {
 		},
 	}
 
-	// Get the tag from the reference
+	// Extract the tag from the image reference.
 	tag := ref
 	if idx := strings.LastIndex(ref, ":"); idx > 0 {
 		tag = ref[idx+1:]
 	}
 
-	// Copy from repository to file store
+	// Copy the artifact from the remote repository to the local file store.
 	copyOpts := oras.DefaultCopyOptions
-	copyOpts.Concurrency = 1
+	copyOpts.Concurrency = 1 // Process layers sequentially.
 
 	_, err = oras.Copy(ctx, repo, tag, fs, tag, copyOpts)
 	if err != nil {
@@ -546,7 +639,7 @@ func orasPull(config *Config, destDir string) error {
 
 	log.Printf("Successfully pulled artifact to %s\n", destDir)
 
-	// List what was actually downloaded for debugging
+	// Log the files that were actually downloaded for debugging purposes.
 	files, err := findYAMLFiles(destDir)
 	if err != nil {
 		log.Printf("Warning: error listing files after pull: %v", err)
@@ -560,8 +653,11 @@ func orasPull(config *Config, destDir string) error {
 	return nil
 }
 
+// pullOCI pulls an OCI image and extracts its layers using the go-containerregistry library.
+// This is primarily used for GitHub Container Registry (GHCR).
 func pullOCI(ctx context.Context, imageRef, outputDir string) error {
-	// Parse the image reference
+	// Parse the image reference string into a structured object.
+	// This step validates the format of the image reference.
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return fmt.Errorf("parsing image reference: %w", err)
@@ -569,18 +665,20 @@ func pullOCI(ctx context.Context, imageRef, outputDir string) error {
 
 	log.Printf("Pulling files from OCI image: %s\n", ref.Name())
 
-	// Pull the image using default keychain (uses Docker credentials if available)
+	// Pull the image's descriptor using the default keychain for authentication.
+	// The default keychain automatically uses Docker credentials if available.
 	desc, err := remote.Get(ref, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
 		return fmt.Errorf("getting remote image: %w", err)
 	}
 
+	// Convert the image descriptor into a full image object.
 	img, err := desc.Image()
 	if err != nil {
 		return fmt.Errorf("converting to image: %w", err)
 	}
 
-	// Get image layers
+	// Retrieve all layers from the OCI image. Each layer typically contains a part of the artifact.
 	layers, err := img.Layers()
 	if err != nil {
 		return fmt.Errorf("getting image layers: %w", err)
@@ -588,7 +686,7 @@ func pullOCI(ctx context.Context, imageRef, outputDir string) error {
 
 	log.Printf("Found %d layers\n", len(layers))
 
-	// Process each layer
+	// Process each layer, extracting its content to the specified output directory.
 	fileCount := 0
 	for i, layer := range layers {
 		if err := processLayer(layer, outputDir, i, &fileCount); err != nil {
@@ -605,8 +703,10 @@ func pullOCI(ctx context.Context, imageRef, outputDir string) error {
 	return nil
 }
 
+// processLayer extracts the content of a single OCI layer and saves it to a file.
+// It tries to determine if the layer contains a policy and names the file accordingly.
 func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *int) error {
-	// Get layer media type
+	// Determine the media type of the layer, which can hint at its content (e.g., a policy layer).
 	mediaType, err := layer.MediaType()
 	if err != nil {
 		return fmt.Errorf("getting media type: %w", err)
@@ -614,7 +714,7 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 
 	log.Printf("Layer %d media type: %s\n", layerIndex, mediaType)
 
-	// Get layer content
+	// Get the compressed content of the layer.
 	blob, err := layer.Compressed()
 	if err != nil {
 		return fmt.Errorf("getting compressed layer: %w", err)
@@ -625,7 +725,7 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 		}
 	}()
 
-	// Read the layer content
+	// Read all content from the layer's blob.
 	content, err := io.ReadAll(blob)
 	if err != nil {
 		return fmt.Errorf("reading layer content: %w", err)
@@ -636,29 +736,33 @@ func processLayer(layer v1.Layer, outputDir string, layerIndex int, fileCount *i
 		return nil
 	}
 
-	// Save layer content to file
+	// Construct a filename for the extracted content.
 	filename := filepath.Join(outputDir, fmt.Sprintf("layer-%d.yaml", layerIndex))
 
-	// If it's a policy layer, try to give it a better name
+	// If the layer is identified as a policy layer, use a more descriptive filename.
 	if mediaType == PolicyLayerMediaType {
 		filename = filepath.Join(outputDir, fmt.Sprintf("policy-%d.yaml", layerIndex))
 	}
 
+	// Write the layer's content to the file system.
 	if err := os.WriteFile(filename, content, 0644); err != nil {
 		return fmt.Errorf("writing file: %w", err)
 	}
 
 	log.Printf("  Saved to: %s (%d bytes)\n", filepath.Base(filename), len(content))
+	// Increment the counter for successfully extracted files.
 	*fileCount++
 
 	return nil
 }
 
-//nolint:unused // Used via applyManifestsFunc for testing
+// applyManifests is a wrapper for applyManifestsFunc (used for testing).
 func applyManifests(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
 	return applyManifestsFunc(config, files, mapper, dynamicClient)
 }
 
+// applyManifestsReal iterates through a list of YAML files and applies each one to the Kubernetes cluster.
+// It logs the application status for each file.
 func applyManifestsReal(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
 	if len(files) == 0 {
 		log.Printf("No YAML manifests found to apply\n")
@@ -671,7 +775,7 @@ func applyManifestsReal(config *Config, files []string, mapper meta.RESTMapper, 
 		log.Printf("Applying %s\n", f)
 		if err := applyManifestFile(f, dynamicClient, mapper); err != nil {
 			log.Printf("Failed to apply %s: %v\n", f, err)
-			// Continue with other files even if one fails
+			// Continue with other files even if one fails, to ensure as many policies as possible are applied.
 			continue
 		}
 		log.Printf("Successfully applied %s\n", f)
@@ -680,35 +784,38 @@ func applyManifestsReal(config *Config, files []string, mapper meta.RESTMapper, 
 	return nil
 }
 
-// applyManifestFile reads a YAML file and applies it to the cluster.
-// It supports multi-document YAML files (documents separated by ---).
+// applyManifestFile reads a YAML file and applies its content(s) to the Kubernetes cluster.
+// It supports multi-document YAML files (where documents are separated by '---').
 func applyManifestFile(filePath string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer func() {
-		_ = f.Close()
+		_ = f.Close() // Close the file when the function exits.
 	}()
 
+	// Use a YAML or JSON decoder to handle different input formats.
 	decoder := k8syaml.NewYAMLOrJSONDecoder(f, 4096)
 	docIndex := 0
 
+	// Iterate through each document in the (potentially multi-document) YAML file.
 	for {
 		obj := &unstructured.Unstructured{}
 		if err := decoder.Decode(obj); err != nil {
 			if err == io.EOF {
-				break
+				break // End of file, no more documents.
 			}
 			return fmt.Errorf("failed to decode YAML document %d: %w", docIndex, err)
 		}
 
-		// Skip empty documents (e.g., documents with only comments or whitespace)
+		// Skip empty documents (e.g., documents with only comments or whitespace).
 		if len(obj.Object) == 0 {
 			docIndex++
 			continue
 		}
 
+		// Apply the current Kubernetes resource (document) to the cluster.
 		if err := applyResource(obj, dynamicClient, mapper); err != nil {
 			return fmt.Errorf("failed to apply document %d: %w", docIndex, err)
 		}
@@ -719,9 +826,11 @@ func applyManifestFile(filePath string, dynamicClient dynamic.Interface, mapper 
 	return nil
 }
 
-// applyResource applies a single unstructured resource to the cluster
+// applyResource applies a single unstructured Kubernetes resource (e.g., a Policy or ClusterPolicy) to the cluster.
+// It handles both creation and updates, and correctly identifies whether a resource is namespaced or cluster-scoped.
 func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interface, mapper meta.RESTMapper) error {
-	// Get GVR from the object using the REST mapper for proper pluralization
+	// Use the Kubernetes REST mapper to get the GroupVersionResource (GVR) for the object.
+	// The GVR is needed to interact with the dynamic client and correctly pluralize resource names.
 	gvk := obj.GroupVersionKind()
 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
@@ -732,52 +841,55 @@ func applyResource(obj *unstructured.Unstructured, dynamicClient dynamic.Interfa
 	ctx := context.Background()
 	namespace := obj.GetNamespace()
 
-	// Determine if resource is cluster-scoped or namespaced based on the REST mapping
-	// Some resources like ClusterPolicy have namespace in their YAML but are actually cluster-scoped
+	// Determine if the resource is cluster-scoped or namespaced based on its REST mapping.
+	// This is important because some resources (like ClusterPolicies) might have a namespace field
+	// in their YAML but are inherently cluster-scoped in Kubernetes.
 	isNamespaced := mapping.Scope.Name() == meta.RESTScopeNameNamespace
 
-	// If resource is cluster-scoped, remove namespace field if present
+	// If a resource is cluster-scoped but its YAML manifest specifies a namespace,
+	// remove the namespace field to prevent validation errors in Kubernetes.
 	if !isNamespaced && namespace != "" {
 		log.Printf("Warning: %s/%s is cluster-scoped but has namespace '%s' - removing namespace field\n",
 			gvk.Kind, obj.GetName(), namespace)
 		obj.SetNamespace("")
-		namespace = ""
+		namespace = "" // Clear the namespace for dynamic client operations.
 	}
 
-	// Try to create or update the resource
+	// Attempt to get the existing resource from the cluster.
+	// If it exists, we'll update it; otherwise, we'll create it.
+	var existing *unstructured.Unstructured
 	if isNamespaced && namespace != "" {
-		// Namespaced resource
-		existing, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
-		if err != nil {
-			// Resource doesn't exist, create it
-			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to create resource: %w", err)
-			}
-		} else {
-			// Resource exists, update it
-			obj.SetResourceVersion(existing.GetResourceVersion())
-			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to update resource: %w", err)
-			}
-		}
+		// Handle namespaced resources: scope the Get/Create/Update operation to the specified namespace.
+		existing, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
 	} else {
-		// Cluster-scoped resource
-		existing, err := dynamicClient.Resource(gvr).Get(ctx, obj.GetName(), metav1.GetOptions{})
-		if err != nil {
-			// Resource doesn't exist, create it
-			_, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to create resource: %w", err)
-			}
+		// Handle cluster-scoped resources: perform Get/Create/Update at the cluster level.
+		existing, err = dynamicClient.Resource(gvr).Get(ctx, obj.GetName(), metav1.GetOptions{})
+	}
+
+	if err != nil && errors.IsNotFound(err) {
+		// Resource does not exist, so create it.
+		if isNamespaced && namespace != "" {
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
 		} else {
-			// Resource exists, update it
-			obj.SetResourceVersion(existing.GetResourceVersion())
+			_, err = dynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+		}
+		if err != nil {
+			return fmt.Errorf("failed to create resource: %w", err)
+		}
+	} else if err != nil {
+		// An unexpected error occurred while trying to fetch the resource.
+		return fmt.Errorf("failed to get existing resource: %w", err)
+	} else {
+		// Resource already exists, so update it.
+		// It's crucial to set the ResourceVersion from the existing object to prevent conflicts.
+		obj.SetResourceVersion(existing.GetResourceVersion())
+		if isNamespaced && namespace != "" {
+			_, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+		} else {
 			_, err = dynamicClient.Resource(gvr).Update(ctx, obj, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to update resource: %w", err)
-			}
+		}
+		if err != nil {
+			return fmt.Errorf("failed to update resource: %w", err)
 		}
 	}
 

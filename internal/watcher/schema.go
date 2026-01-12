@@ -45,6 +45,7 @@ type Config struct {
 	Package                       string
 	PackageNormalized             string
 	PollInterval                  int
+	PollForTagChanges             bool
 	GithubAPIOwnerType            string
 	StateDir                      string
 	LastFile                      string
@@ -124,6 +125,7 @@ func loadConfig() *Config {
 	}
 
 	pollInterval := getEnvAsIntOrDefault("POLL_INTERVAL", 30)
+	pollForTagChanges := getEnvAsBoolOrDefault("WATCHER_POLL_FOR_TAG_CHANGES_ENABLED", true)
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
 	deletePoliciesOnTermination := getEnvAsBoolOrDefault("WATCHER_DELETE_POLICIES_ON_TERMINATION", false)
 	reconcilePoliciesFromChecksum := getEnvAsBoolOrDefault("WATCHER_CHECKSUM_RECONCILIATION_ENABLED", false)
@@ -155,6 +157,7 @@ func loadConfig() *Config {
 		Package:                       packageName,
 		PackageNormalized:             packageNormalized,
 		PollInterval:                  pollInterval,
+		PollForTagChanges:             pollForTagChanges,
 		GithubAPIOwnerType:            githubAPIOwnerType,
 		StateDir:                      stateDir,
 		LastFile:                      lastFile,

@@ -545,9 +545,10 @@ func TestWatchLoopProviderBehavior(t *testing.T) {
 			defer func() { getKubernetesClientsFunc = originalGetK8sClients }()
 
 			config := &Config{
-				Provider:  tt.provider,
-				ImageBase: tt.imageBase,
-				StateDir:  testTempDir,
+				Provider:          tt.provider,
+				ImageBase:         tt.imageBase,
+				StateDir:          testTempDir,
+				PollForTagChanges: true, // Keep original test behavior
 			}
 			config.LastFile = config.StateDir + "/last_seen"
 
@@ -883,6 +884,104 @@ func TestVersion(t *testing.T) {
 	Version = oldVersion
 }
 
+func TestLoadConfig_BoolFlags(t *testing.T) {
+	tests := []struct {
+		name                       string
+		envVars                    map[string]string
+		wantPollForTagChanges      bool
+		wantDeleteOnTermination    bool
+		wantChecksumReconciliation bool
+	}{
+		{
+			name: "all flags default",
+			envVars: map[string]string{
+				"GITHUB_TOKEN": "ghp_test123",
+				"IMAGE_BASE":   "ghcr.io/owner/package",
+			},
+			wantPollForTagChanges:      true, // Defaults to true
+			wantDeleteOnTermination:    false,
+			wantChecksumReconciliation: false,
+		},
+		{
+			name: "all flags enabled",
+			envVars: map[string]string{
+				"GITHUB_TOKEN":                            "ghp_test123",
+				"IMAGE_BASE":                              "ghcr.io/owner/package",
+				"WATCHER_POLL_FOR_TAG_CHANGES_ENABLED":    "true",
+				"WATCHER_DELETE_POLICIES_ON_TERMINATION":  "true",
+				"WATCHER_CHECKSUM_RECONCILIATION_ENABLED": "true",
+			},
+			wantPollForTagChanges:      true,
+			wantDeleteOnTermination:    true,
+			wantChecksumReconciliation: true,
+		},
+		{
+			name: "all flags disabled",
+			envVars: map[string]string{
+				"GITHUB_TOKEN":                            "ghp_test123",
+				"IMAGE_BASE":                              "ghcr.io/owner/package",
+				"WATCHER_POLL_FOR_TAG_CHANGES_ENABLED":    "false",
+				"WATCHER_DELETE_POLICIES_ON_TERMINATION":  "false",
+				"WATCHER_CHECKSUM_RECONCILIATION_ENABLED": "false",
+			},
+			wantPollForTagChanges:      false,
+			wantDeleteOnTermination:    false,
+			wantChecksumReconciliation: false,
+		},
+		{
+			name: "boolean-like values for true",
+			envVars: map[string]string{
+				"GITHUB_TOKEN":                            "ghp_test123",
+				"IMAGE_BASE":                              "ghcr.io/owner/package",
+				"WATCHER_POLL_FOR_TAG_CHANGES_ENABLED":    "t",
+				"WATCHER_DELETE_POLICIES_ON_TERMINATION":  "1",
+				"WATCHER_CHECKSUM_RECONCILIATION_ENABLED": "True",
+			},
+			wantPollForTagChanges:      true,
+			wantDeleteOnTermination:    true,
+			wantChecksumReconciliation: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalStateDirBase := stateDirBase
+			stateDirBase = t.TempDir()
+			defer func() {
+				stateDirBase = originalStateDirBase
+			}()
+
+			originalGetEnvFunc := getEnvFunc
+			getEnvFunc = func(key string) string {
+				return tt.envVars[key]
+			}
+			defer func() {
+				getEnvFunc = originalGetEnvFunc
+			}()
+
+			originalLogFatal := logFatal
+			logFatal = func(v ...interface{}) {
+				// Don't panic, just record error for verification if needed
+			}
+			defer func() {
+				logFatal = originalLogFatal
+			}()
+
+			config := loadConfig()
+
+			if config.PollForTagChanges != tt.wantPollForTagChanges {
+				t.Errorf("loadConfig() PollForTagChanges = %v, want %v", config.PollForTagChanges, tt.wantPollForTagChanges)
+			}
+			if config.DeletePoliciesOnTermination != tt.wantDeleteOnTermination {
+				t.Errorf("loadConfig() DeletePoliciesOnTermination = %v, want %v", config.DeletePoliciesOnTermination, tt.wantDeleteOnTermination)
+			}
+			if config.ReconcilePoliciesFromChecksum != tt.wantChecksumReconciliation {
+				t.Errorf("loadConfig() ReconcilePoliciesFromChecksum = %v, want %v", config.ReconcilePoliciesFromChecksum, tt.wantChecksumReconciliation)
+			}
+		})
+	}
+}
+
 func TestWatchLoopReconciliationLogic(t *testing.T) {
 	tests := []struct {
 		name                         string
@@ -989,6 +1088,7 @@ func TestWatchLoopReconciliationLogic(t *testing.T) {
 
 			// --- Test execution ---
 			config := &Config{
+				PollForTagChanges:             true, // Keep original test behavior
 				ReconcilePoliciesFromChecksum: tt.reconcileFromChecksumEnabled,
 				StateDir:                      t.TempDir(),
 			}
@@ -1108,6 +1208,140 @@ func TestTagChanged_PollingDisabled(t *testing.T) {
 
 			if latest != tt.expectedTag {
 				t.Errorf("tagChanged() latest = %q, want %q", latest, tt.expectedTag)
+			}
+		})
+	}
+}
+
+func TestWatchLoop_PollingDisabled(t *testing.T) {
+	tests := []struct {
+		name                         string
+		imageBase                    string
+		lastSeenTag                  string // The content of the "last_seen" file
+		checksumsAreChanged          bool
+		reconcileFromChecksumEnabled bool
+		expectPull                   bool
+		expectChecksumCheck          bool
+		expectApply                  bool
+	}{
+		{
+			name:                         "polling disabled, first run with tagged image",
+			imageBase:                    "ghcr.io/owner/image:v1.0.0",
+			lastSeenTag:                  "", // No last_seen file
+			reconcileFromChecksumEnabled: true,
+			expectPull:                   true,
+			expectChecksumCheck:          false, // isTagChanged is true, so this is skipped
+			expectApply:                  true,
+		},
+		{
+			name:                         "polling disabled, no tag change, no checksum reconciliation",
+			imageBase:                    "ghcr.io/owner/image:v1.0.0",
+			lastSeenTag:                  "v1.0.0",
+			reconcileFromChecksumEnabled: false, // Disabled
+			expectPull:                   false, // Skips everything
+			expectChecksumCheck:          false,
+			expectApply:                  false,
+		},
+		{
+			name:                         "polling disabled, no tag change, checksum reconciliation enabled but no changes",
+			imageBase:                    "ghcr.io/owner/image:v1.0.0",
+			lastSeenTag:                  "v1.0.0",
+			checksumsAreChanged:          false,
+			reconcileFromChecksumEnabled: true,
+			expectPull:                   true,
+			expectChecksumCheck:          true,
+			expectApply:                  false,
+		},
+		{
+			name:                         "polling disabled, no tag change, checksum reconciliation enabled with changes",
+			imageBase:                    "ghcr.io/owner/image:v1.0.0",
+			lastSeenTag:                  "v1.0.0",
+			checksumsAreChanged:          true,
+			reconcileFromChecksumEnabled: true,
+			expectPull:                   true,
+			expectChecksumCheck:          true,
+			expectApply:                  true,
+		},
+		{
+			name:                         "polling disabled, tag in image base has changed",
+			imageBase:                    "ghcr.io/owner/image:v1.1.0", // New tag
+			lastSeenTag:                  "v1.0.0",
+			reconcileFromChecksumEnabled: true,
+			expectPull:                   true,
+			expectChecksumCheck:          false, // isTagChanged is true
+			expectApply:                  true,
+		},
+		{
+			name:                         "polling disabled, no tag in image base",
+			imageBase:                    "ghcr.io/owner/image",
+			lastSeenTag:                  "v1.0.0",
+			reconcileFromChecksumEnabled: true,
+			expectPull:                   false, // Should do nothing
+			expectChecksumCheck:          false,
+			expectApply:                  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// --- Mock setup ---
+			var pullCalled, checksumCheckCalled, applyCalled bool
+
+			originalGetK8sClients := getKubernetesClientsFunc
+			getKubernetesClientsFunc = func() (dynamic.Interface, meta.RESTMapper, error) { return nil, nil, nil }
+			defer func() { getKubernetesClientsFunc = originalGetK8sClients }()
+
+			originalPullImageToDirFunc := pullImageToDirFunc
+			pullImageToDirFunc = func(config *Config, tag, destDir string) (map[string]string, error) {
+				pullCalled = true
+				return map[string]string{"file.yaml": "checksum"}, nil
+			}
+			defer func() { pullImageToDirFunc = originalPullImageToDirFunc }()
+
+			originalChecksumsChanged := checksumsChangedFunc
+			checksumsChangedFunc = func(newChecksums map[string]string, dynamicClient dynamic.Interface, mapper meta.RESTMapper) (bool, []string, error) {
+				checksumCheckCalled = true
+				return tt.checksumsAreChanged, []string{"file.yaml"}, nil
+			}
+			defer func() { checksumsChangedFunc = originalChecksumsChanged }()
+
+			originalApplyManifestsFunc := applyManifestsFunc
+			applyManifestsFunc = func(config *Config, files []string, mapper meta.RESTMapper, dynamicClient dynamic.Interface) error {
+				applyCalled = true
+				return nil
+			}
+			defer func() { applyManifestsFunc = originalApplyManifestsFunc }()
+
+			// --- Test execution ---
+			tempDir := t.TempDir()
+			config := &Config{
+				PollForTagChanges:             false, // Testing this specific scenario
+				ImageBase:                     tt.imageBase,
+				ReconcilePoliciesFromChecksum: tt.reconcileFromChecksumEnabled,
+				LastFile:                      filepath.Join(tempDir, "last_seen"),
+			}
+
+			// Create the last_seen file if needed for the test case
+			if tt.lastSeenTag != "" {
+				if err := os.WriteFile(config.LastFile, []byte(tt.lastSeenTag), 0644); err != nil {
+					t.Fatalf("Failed to write last_seen file: %v", err)
+				}
+			}
+
+			err := watchLoop(config)
+			if err != nil {
+				t.Fatalf("watchLoop() returned an unexpected error: %v", err)
+			}
+
+			// --- Assertions ---
+			if pullCalled != tt.expectPull {
+				t.Errorf("pullImageToDirFunc called = %v, want %v", pullCalled, tt.expectPull)
+			}
+			if checksumCheckCalled != tt.expectChecksumCheck {
+				t.Errorf("checksumsChanged called = %v, want %v", checksumCheckCalled, tt.expectChecksumCheck)
+			}
+			if applyCalled != tt.expectApply {
+				t.Errorf("applyManifestsFunc called = %v, want %v", applyCalled, tt.expectApply)
 			}
 		})
 	}

@@ -46,6 +46,9 @@ type KyvernoArtifactSpec struct {
 	// reconcilePoliciesFromChecksum enables or disables policy reconciliation based on checksums.
 	// +optional
 	ReconcilePoliciesFromChecksum *bool `json:"reconcilePoliciesFromChecksum,omitempty"`
+	// pollForTagChanges enables or disables polling for new tags. If disabled, the watcher will use the tag specified in the artifactUrl.
+	// +optional
+	PollForTagChanges *bool `json:"pollForTagChanges,omitempty"`
 }
 
 // KyvernoArtifactStatus defines the observed state of KyvernoArtifact.

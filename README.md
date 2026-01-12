@@ -67,6 +67,12 @@ spec:
   # Defaults to false. Can be overridden by the WATCHER_CHECKSUM_RECONCILIATION_ENABLED environment variable.
   # +optional
   reconcilePoliciesFromChecksum: false
+  # pollForTagChanges enables or disables polling for new image tags.
+  # If set to false, the watcher will only use the specific tag provided in the 'url' field and will not look for newer tags.
+  # This is useful for pinning to a specific version while still benefiting from checksum-based reconciliation.
+  # Defaults to true.
+  # +optional
+  pollForTagChanges: true
 ```
 
 #### For Artifactory:
@@ -94,6 +100,12 @@ spec:
   # Defaults to false. Can be overridden by the WATCHER_CHECKSUM_RECONCILIATION_ENABLED environment variable.
   # +optional
   reconcilePoliciesFromChecksum: false
+  # pollForTagChanges enables or disables polling for new image tags.
+  # If set to false, the watcher will only use the specific tag provided in the 'url' field and will not look for newer tags.
+  # This is useful for pinning to a specific version while still benefiting from checksum-based reconciliation.
+  # Defaults to true.
+  # +optional
+  pollForTagChanges: true
 ```
 
 ```bash
@@ -179,6 +191,7 @@ When running in watcher mode, the binary requires these environment variables:
 - `POLL_INTERVAL`: Poll interval in seconds (default: 30)
 - `WATCHER_DELETE_POLICIES_ON_TERMINATION`: If set to "true", policies will be deleted on watcher termination (default: false)
 - `WATCHER_CHECKSUM_RECONCILIATION_ENABLED`: If set to "true", enables reconciliation of policies based on content checksums (default: false)
+- `WATCHER_POLL_FOR_TAG_CHANGES_ENABLED`: If set to "false", disables polling for new tags and uses the tag specified in `IMAGE_BASE` (default: true)
 
 #### Garbage Collector Mode
 

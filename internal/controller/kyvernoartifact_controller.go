@@ -112,7 +112,8 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if kyvernoArtifact.Spec.DeletePoliciesOnTermination != nil && *kyvernoArtifact.Spec.DeletePoliciesOnTermination {
 			envVars = append(envVars, corev1.EnvVar{
-				Name:  "WATCHER_DELETE_POLICIES_ON_TERMINATION",
+				Name: "WATCHER_DELETE_POLICIES_ON_TERMINATION",
+				//nolint:goconst // Required value for environment variable
 				Value: "true",
 			})
 		}
@@ -121,6 +122,13 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "WATCHER_CHECKSUM_RECONCILIATION_ENABLED",
 				Value: fmt.Sprintf("%t", *kyvernoArtifact.Spec.ReconcilePoliciesFromChecksum),
+			})
+		}
+
+		if kyvernoArtifact.Spec.PollForTagChanges != nil {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "WATCHER_POLL_FOR_TAG_CHANGES_ENABLED",
+				Value: fmt.Sprintf("%t", *kyvernoArtifact.Spec.PollForTagChanges),
 			})
 		}
 
@@ -266,6 +274,23 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			if envMap["PROVIDER"] != currentProvider {
 				log.Info("Pod needs update: PROVIDER changed", "old", envMap["PROVIDER"], "new", currentProvider)
+				needsUpdate = true
+			}
+
+			// Check if WATCHER_POLL_FOR_TAG_CHANGES_ENABLED has changed
+			//nolint:goconst // This is the default in the watcher
+			currentPollForTagChanges := "true"
+			if kyvernoArtifact.Spec.PollForTagChanges != nil {
+				currentPollForTagChanges = fmt.Sprintf("%t", *kyvernoArtifact.Spec.PollForTagChanges)
+			}
+			podPollForTagChanges, ok := envMap["WATCHER_POLL_FOR_TAG_CHANGES_ENABLED"]
+			if !ok {
+				// If the env var is not set in the pod, assume the default value
+				//nolint:goconst // This is the default in the watcher
+				podPollForTagChanges = "true"
+			}
+			if podPollForTagChanges != currentPollForTagChanges {
+				log.Info("Pod needs update: WATCHER_POLL_FOR_TAG_CHANGES_ENABLED changed", "old", podPollForTagChanges, "new", currentPollForTagChanges)
 				needsUpdate = true
 			}
 		}
