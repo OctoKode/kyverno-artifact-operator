@@ -42,6 +42,7 @@ spec:
               deletePoliciesOnTermination:
                 type: boolean
               pollForTagChanges:
+                default: true
                 description: pollForTagChanges enables or disables polling for new
                   tags. If disabled, the watcher will use the tag specified in the
                   artifactUrl.

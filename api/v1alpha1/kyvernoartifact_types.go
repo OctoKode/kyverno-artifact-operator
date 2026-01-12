@@ -48,6 +48,7 @@ type KyvernoArtifactSpec struct {
 	ReconcilePoliciesFromChecksum *bool `json:"reconcilePoliciesFromChecksum,omitempty"`
 	// pollForTagChanges enables or disables polling for new tags. If disabled, the watcher will use the tag specified in the artifactUrl.
 	// +optional
+	// +default=true
 	PollForTagChanges *bool `json:"pollForTagChanges,omitempty"`
 }
 

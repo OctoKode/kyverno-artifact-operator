@@ -4,6 +4,14 @@ metadata:
   name: kyverno-artifact-operator-watcher-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - delete
+- apiGroups:
   - kyverno.io
   resources:
   - policies

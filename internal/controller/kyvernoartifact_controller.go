@@ -170,12 +170,28 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			})
 		}
 
+		// Inject WATCHER_IMAGE and POD_NAMESPACE for self-reconciliation
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "WATCHER_IMAGE",
+			Value: r.Config.WatcherImage,
+		}, corev1.EnvVar{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.namespace",
+				},
+			},
+		})
+
 		pod = &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      podName,
 				Namespace: kyvernoArtifact.Namespace,
 				Labels: map[string]string{
-					"app": podName,
+					"app.kubernetes.io/name":       "kyverno-artifact-watcher",
+					"app.kubernetes.io/instance":   kyvernoArtifact.Name,
+					"app.kubernetes.io/managed-by": "kyverno-artifact-operator",
+					"app.kubernetes.io/component":  "watcher",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -291,6 +307,12 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			if podPollForTagChanges != currentPollForTagChanges {
 				log.Info("Pod needs update: WATCHER_POLL_FOR_TAG_CHANGES_ENABLED changed", "old", podPollForTagChanges, "new", currentPollForTagChanges)
+				needsUpdate = true
+			}
+
+			// Check if the pod's image needs to be updated
+			if container.Image != r.Config.WatcherImage {
+				log.Info("Pod needs update: watcher image changed", "old", container.Image, "new", r.Config.WatcherImage)
 				needsUpdate = true
 			}
 		}
