@@ -8,9 +8,13 @@ rules:
   resources:
   - pods
   verbs:
+  - create
+  - delete
   - get
   - list
-  - delete
+  - patch
+  - update
+  - watch
 - apiGroups:
   - kyverno.io
   resources:

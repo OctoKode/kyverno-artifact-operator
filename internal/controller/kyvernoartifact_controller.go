@@ -233,7 +233,13 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		if err := r.Create(ctx, pod); err != nil {
-			log.Error(err, "unable to create Pod")
+			log.Error(err, "unable to create Pod",
+				"KyvernoArtifact.Name", kyvernoArtifact.Name,
+				"KyvernoArtifact.Namespace", kyvernoArtifact.Namespace,
+				"Pod.Name", pod.Name,
+				"Pod.ServiceAccountName", pod.Spec.ServiceAccountName,
+				"Pod.Image", pod.Spec.Containers[0].Image,
+			)
 			return ctrl.Result{}, err
 		}
 		log.Info("Created Pod", "Name", podName)
