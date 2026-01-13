@@ -43,9 +43,9 @@ spec:
                 type: boolean
               pollForTagChanges:
                 default: true
-                description: pollForTagChanges enables or disables polling for new
-                  tags. If disabled, the watcher will use the tag specified in the
-                  artifactUrl.
+                description: |-
+                  pollForTagChanges enables or disables polling for new tags. If disabled, the watcher will use the tag specified in the artifactUrl.
+                  Defaults to true, explicitly set in the CRD to ensure active monitoring by default.
                 type: boolean
               pollingInterval:
                 description: pollingInterval is the interval in seconds to check for

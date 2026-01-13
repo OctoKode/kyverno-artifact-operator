@@ -55,6 +55,8 @@ type Config struct {
 	ArtifactName                  string // Name of the KyvernoArtifact resource that owns this watcher
 	DeletePoliciesOnTermination   bool   // Whether to delete policies on termination
 	ReconcilePoliciesFromChecksum bool   // Whether to reconcile policies based on checksums
+	WatcherImage                  string // WatcherImage is the full container image string for the watcher itself, used by the self-reconciliation logic to check if it's running the latest version.
+	PodNamespace                  string // PodNamespace is the Kubernetes namespace where this watcher pod is currently running, used by the self-reconciliation logic to discover other watcher pods.
 }
 
 type GitHubPackageVersion struct {
@@ -129,6 +131,10 @@ func loadConfig() *Config {
 	githubAPIOwnerType := getEnvOrDefault("GITHUB_API_OWNER_TYPE", "users")
 	deletePoliciesOnTermination := getEnvAsBoolOrDefault("WATCHER_DELETE_POLICIES_ON_TERMINATION", false)
 	reconcilePoliciesFromChecksum := getEnvAsBoolOrDefault("WATCHER_CHECKSUM_RECONCILIATION_ENABLED", false)
+	// Retrieve the expected watcher image from environment variable, injected by the operator.
+	watcherImage := getEnvFunc("WATCHER_IMAGE")
+	// Retrieve the watcher pod's namespace from environment variable, injected via Downward API by the operator.
+	podNamespace := getEnvFunc("POD_NAMESPACE")
 
 	// Get artifact name from pod name (format: kyverno-artifact-manager-{artifactName})
 	// This is used to link policies back to their source KyvernoArtifact for garbage collection
@@ -167,6 +173,8 @@ func loadConfig() *Config {
 		ArtifactName:                  artifactName,
 		DeletePoliciesOnTermination:   deletePoliciesOnTermination,
 		ReconcilePoliciesFromChecksum: reconcilePoliciesFromChecksum,
+		WatcherImage:                  watcherImage,
+		PodNamespace:                  podNamespace,
 	}
 }
 

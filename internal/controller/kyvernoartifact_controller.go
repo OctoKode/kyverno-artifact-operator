@@ -170,7 +170,9 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			})
 		}
 
-		// Inject WATCHER_IMAGE and POD_NAMESPACE for self-reconciliation
+		// Inject WATCHER_IMAGE and POD_NAMESPACE for self-reconciliation.
+		// WATCHER_IMAGE provides the expected image version for the watcher pod to compare against.
+		// POD_NAMESPACE allows the watcher to discover other pods in its own namespace for reconciliation.
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "WATCHER_IMAGE",
 			Value: r.Config.WatcherImage,
@@ -187,9 +189,11 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      podName,
 				Namespace: kyvernoArtifact.Namespace,
+				// Apply standardized labels to the watcher pod for better discoverability and management.
+				// These labels are crucial for the watcher's self-reconciliation logic to find other watcher pods.
 				Labels: map[string]string{
 					"app.kubernetes.io/name":       "kyverno-artifact-watcher",
-					"app.kubernetes.io/instance":   kyvernoArtifact.Name,
+					"app.kubernetes.io/instance":   kyvernoArtifact.Name, // Identifies the KyvernoArtifact resource instance
 					"app.kubernetes.io/managed-by": "kyverno-artifact-operator",
 					"app.kubernetes.io/component":  "watcher",
 				},
@@ -311,6 +315,10 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Check if the pod's image needs to be updated
+			// Crucial check for watcher self-reconciliation: ensure the watcher pod is running the latest image.
+			// If the image of the running pod's container doesn't match the expected WatcherImage from the controller's config,
+			// it indicates that the operator itself has been upgraded and this watcher pod is now outdated.
+			// Deleting it will cause Kubernetes to recreate the pod with the correct (latest) image.
 			if container.Image != r.Config.WatcherImage {
 				log.Info("Pod needs update: watcher image changed", "old", container.Image, "new", r.Config.WatcherImage)
 				needsUpdate = true

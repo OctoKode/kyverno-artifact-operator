@@ -126,7 +126,7 @@ jobs:
 
           # Build for multiple platforms
           for OS in linux darwin; do
-            for ARCH in amd64 arm64; do
+            for ARCH in amd64; do
               echo "Building for $OS/$ARCH..."
               GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build \
                 -ldflags "-X main.version=${VERSION}" \
@@ -198,7 +198,7 @@ jobs:
             IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
             docker buildx build \
               --file Dockerfile \
-              --platform linux/amd64,linux/arm64 \
+              --platform linux/amd64 \
               --build-arg VERSION=${{ steps.bump.outputs.new_tag }} \
               --tag ${IMAGE_NAME_LOWER}:latest \
               --tag ${IMAGE_NAME_LOWER}:${{ steps.bump.outputs.new_tag }} \
