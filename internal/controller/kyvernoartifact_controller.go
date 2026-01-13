@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -251,13 +252,8 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// Check if pod is in a terminal state
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
-			log.Info("Pod is in terminal state, deleting for recreation", "Name", podName, "Phase", pod.Status.Phase)
-			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
-				log.Error(err, "unable to delete Pod in terminal state")
-				return ctrl.Result{}, err
-			}
 			// The Owns() relationship will trigger reconciliation when the pod is deleted
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		// Check if the pod configuration needs to be updated by comparing env vars
@@ -338,7 +334,7 @@ func (r *KyvernoArtifactReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 			// The Owns() relationship will trigger reconciliation when the pod is deleted
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		log.Info("Pod already exists and is running", "Name", podName, "Phase", pod.Status.Phase)
