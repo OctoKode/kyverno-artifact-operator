@@ -62,92 +62,6 @@ var (
 	podsGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 )
 
-// reconcileManagedPods checks for outdated watcher pods managed by the operator
-// and deletes them to ensure all watchers are running the latest version.
-// This function runs once on startup of a watcher pod.
-func reconcileManagedPods(config *Config) error {
-	// If the WATCHER_IMAGE environment variable is not set, this watcher cannot perform
-	// self-reconciliation, so skip this step. This would typically happen if the operator
-	// deployment is not configured correctly or during local development/testing without full context.
-	if config.WatcherImage == "" {
-		log.Println("WATCHER_IMAGE not set in watcher configuration, skipping managed pod reconciliation.")
-		return nil
-	}
-	// If the PodNamespace is not set, the watcher cannot determine its own namespace to list
-	// other pods, so skip this step. This should be injected by the operator via the Downward API.
-	if config.PodNamespace == "" {
-		log.Println("POD_NAMESPACE not set in watcher configuration, skipping managed pod reconciliation.")
-		return nil
-	}
-
-	log.Printf("Starting managed pod reconciliation for watcher image: %s in namespace: %s\n", config.WatcherImage, config.PodNamespace)
-
-	dynamicClient, _, err := getKubernetesClientsFunc()
-	if err != nil {
-		return fmt.Errorf("failed to get Kubernetes clients for managed pod reconciliation: %w", err)
-	}
-
-	// Define the label selector to find all watcher pods managed by this operator.
-	// This relies on the standardized labels applied by the KyvernoArtifact controller.
-	labelSelector := "app.kubernetes.io/managed-by=kyverno-artifact-operator,app.kubernetes.io/component=watcher"
-
-	// List all pods matching the label selector in the current namespace.
-	podList, err := dynamicClient.Resource(podsGVR).Namespace(config.PodNamespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to list managed pods with selector %q in namespace %q: %w", labelSelector, config.PodNamespace, err)
-	}
-
-	if len(podList.Items) == 0 {
-		log.Printf("No managed watcher pods found with selector %q in namespace %q.\n", labelSelector, config.PodNamespace)
-		return nil
-	}
-
-	for _, pod := range podList.Items {
-		// Ensure the pod has at least one container and its image can be checked.
-		containers, found, err := unstructured.NestedSlice(pod.Object, "spec", "containers")
-		if err != nil || !found || len(containers) == 0 {
-			log.Printf("Skipping pod %s/%s: could not get containers from spec: %v, found: %t.\n", pod.GetNamespace(), pod.GetName(), err, found)
-			continue
-		}
-
-		container, ok := containers[0].(map[string]interface{})
-		if !ok {
-			log.Printf("Skipping pod %s/%s: first container is not a map.\n", pod.GetNamespace(), pod.GetName())
-			continue
-		}
-
-		image, found, err := unstructured.NestedString(container, "image")
-		if err != nil || !found {
-			log.Printf("Skipping pod %s/%s: could not get image from first container: %v, found: %t.\n", pod.GetNamespace(), pod.GetName(), err, found)
-			continue
-		}
-		containerImage := image
-		// Compare the image of the running pod with the expected WATCHER_IMAGE from this watcher's configuration.
-		if containerImage != config.WatcherImage {
-			log.Printf("Detected outdated watcher pod: %s/%s. Current image: %s, Expected image: %s. Deleting pod for recreation.\n",
-				pod.GetNamespace(), pod.GetName(), containerImage, config.WatcherImage)
-
-			// Delete the pod. Kubernetes (specifically the ReplicaSet/Deployment controller)
-			// will automatically recreate it with the correct image based on its owner reference.
-			err := dynamicClient.Resource(podsGVR).Namespace(pod.GetNamespace()).Delete(context.Background(), pod.GetName(), metav1.DeleteOptions{})
-			if err != nil {
-				// Log the error but continue processing other pods to ensure maximum cleanup.
-				log.Printf("Error deleting outdated pod %s/%s: %v\n", pod.GetNamespace(), pod.GetName(), err)
-			} else {
-				log.Printf("Successfully deleted outdated watcher pod: %s/%s.\n", pod.GetNamespace(), pod.GetName())
-			}
-		} else {
-			log.Printf("Watcher pod %s/%s is running the expected image: %s. No action needed.\n",
-				pod.GetNamespace(), pod.GetName(), containerImage)
-		}
-	}
-
-	log.Println("Managed pod reconciliation complete.")
-	return nil
-}
-
 // Run starts the artifact watcher. This is the main entry point when the binary is run in watcher mode.
 func Run(version string) {
 	Version = version
@@ -158,13 +72,6 @@ func Run(version string) {
 	// polling intervals, and other operational parameters.
 	config := loadConfig()
 	log.Printf("Using configuration %+v\n", config)
-
-	// Perform self-reconciliation for managed watcher pods on startup.
-	// This ensures that any watcher pods running an outdated image are deleted
-	// and recreated by Kubernetes with the latest version.
-	if err := reconcileManagedPods(config); err != nil {
-		log.Printf("Warning: failed to perform managed pod reconciliation: %v\n", err)
-	}
 
 	// If deletion on termination is enabled, set up a signal handler to catch termination signals (like SIGTERM)
 	// This allows the watcher to perform a graceful shutdown and clean up any policies it has created,
