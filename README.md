@@ -6,6 +6,8 @@ Kubernetes operator that automatically syncs Kyverno policies from OCI artifacts
 
 The Kyverno Artifact Operator watches OCI artifacts for changes and automatically applies Kyverno policies to your Kubernetes cluster. When you push a new version of your policy artifact, the operator detects the change, pulls the new policies, and applies them to your cluster.
 
+Additionally, the watcher now includes a self-reconciliation mechanism. On startup, the watcher checks for and automatically replaces any managed watcher pods that are running an outdated image version, ensuring that all watcher instances are running the latest operator code. This simplifies upgrades and maintains consistency across your policy management infrastructure.
+
 This repository combines both the operator and watcher functionality into a single binary that can operate in three modes:
 - **Operator mode** (default): Manages KyvernoArtifact custom resources and deploys watcher pods
 - **Watcher mode** (`-watcher` flag): Continuously monitors OCI registries for policy updates
@@ -70,7 +72,7 @@ spec:
   # pollForTagChanges enables or disables polling for new image tags.
   # If set to false, the watcher will only use the specific tag provided in the 'url' field and will not look for newer tags.
   # This is useful for pinning to a specific version while still benefiting from checksum-based reconciliation.
-  # Defaults to true.
+  # Defaults to true (explicitly set in CRD).
   # +optional
   pollForTagChanges: true
 ```
@@ -103,7 +105,7 @@ spec:
   # pollForTagChanges enables or disables polling for new image tags.
   # If set to false, the watcher will only use the specific tag provided in the 'url' field and will not look for newer tags.
   # This is useful for pinning to a specific version while still benefiting from checksum-based reconciliation.
-  # Defaults to true.
+  # Defaults to true (explicitly set in CRD).
   # +optional
   pollForTagChanges: true
 ```
@@ -131,8 +133,11 @@ Or use `make run` which automatically installs CRDs before starting the operator
 ### 4. Verify
 
 ```bash
-# Check the watcher pod
-kubectl get pods -l app=kyverno-artifact-manager-my-policies
+# Check the watcher pod for a specific KyvernoArtifact
+kubectl get pods -l app.kubernetes.io/instance=my-policies,app.kubernetes.io/component=watcher
+
+# To list all watcher pods managed by the operator
+kubectl get pods -l app.kubernetes.io/managed-by=kyverno-artifact-operator,app.kubernetes.io/component=watcher
 
 # View logs
 kubectl logs -f kyverno-artifact-manager-my-policies
@@ -192,6 +197,8 @@ When running in watcher mode, the binary requires these environment variables:
 - `WATCHER_DELETE_POLICIES_ON_TERMINATION`: If set to "true", policies will be deleted on watcher termination (default: false)
 - `WATCHER_CHECKSUM_RECONCILIATION_ENABLED`: If set to "true", enables reconciliation of policies based on content checksums (default: false)
 - `WATCHER_POLL_FOR_TAG_CHANGES_ENABLED`: If set to "false", disables polling for new tags and uses the tag specified in `IMAGE_BASE` (default: true)
+- `WATCHER_IMAGE`: The container image of the watcher pod itself, used for self-reconciliation (e.g., `ghcr.io/octokode/kyverno-artifact-operator:latest`).
+- `POD_NAMESPACE`: The namespace where the watcher pod is running, used for self-reconciliation.
 
 #### Garbage Collector Mode
 
